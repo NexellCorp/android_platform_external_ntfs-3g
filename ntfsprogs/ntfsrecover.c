@@ -1,7 +1,7 @@
 /*
  *		Process log data from an NTFS partition
  *
- * Copyright (c) 2012-2015 Jean-Pierre Andre
+ * Copyright (c) 2012-2017 Jean-Pierre Andre
  *
  *	This program examines the Windows log file of an ntfs partition
  *	and plays the committed transactions in order to restore the
@@ -43,6 +43,7 @@
  */
 
 #define BASEBLKS 4 /* number of special blocks (always shown) */
+#define BASEBLKS2 34 /* number of special blocks when version >= 2.0 */
 #define RSTBLKS 2 /* number of restart blocks */
 #define BUFFERCNT 64 /* number of block buffers - a power of 2 */
 #define NTFSBLKLTH 512 /* usa block size */
@@ -101,6 +102,7 @@
 #include "volume.h"
 #include "unistr.h"
 #include "mst.h"
+#include "logfile.h"
 #include "ntfsrecover.h"
 #include "utils.h"
 #include "misc.h"
@@ -114,13 +116,14 @@ typedef struct {
 
 typedef enum { T_OK, T_ERR, T_DONE } TRISTATE;
 
-struct RESTART_PAGE_HEADER log_header;
-struct RESTART_AREA restart;
-struct RESTART_CLIENT client;
+RESTART_PAGE_HEADER log_header;
+RESTART_AREA restart;
+LOG_CLIENT_RECORD client;
 u32 clustersz = 0;
 int clusterbits;
 u32 blocksz;
 int blockbits;
+int log_major;
 u16 bytespersect;
 u64 mftlcn;
 u32 mftrecsz;
@@ -135,6 +138,7 @@ u64 committed_lsn;
 u64 synced_lsn;
 u64 latest_lsn;
 u64 restart_lsn;
+u64 offset_mask; /* block number in an lsn */
 unsigned long firstblk; /* first block to dump (option -r) */
 unsigned long lastblk;  /* last block to dump (option -r) */
 u64 firstlcn; /* first block to dump (option -c) */
@@ -145,6 +149,7 @@ BOOL optd; /* device argument present*/
 BOOL opth; /* show help */
 BOOL opti; /* show invalid (stale) records */
 BOOL optf; /* show full log */
+BOOL optk; /* kill fast restart */
 BOOL optn; /* do not apply modifications */
 BOOL optp; /* count of transaction sets to play */
 BOOL optr; /* show a range of blocks */
@@ -162,6 +167,7 @@ unsigned int playedactions; // change the name
 unsigned int redocount;
 unsigned int undocount;
 struct BUFFER *buffer_table[BASEBLKS + BUFFERCNT];
+unsigned int redirect[BASEBLKS2];
 
 static const le16 SDS[4] = {
 	const_cpu_to_le16('$'), const_cpu_to_le16('S'),
@@ -206,7 +212,7 @@ static s64 loclogblk(CONTEXT *ctx, unsigned int blk)
 static int replaceusa(struct BUFFER *buffer, unsigned int lth)
 {
 	char *buf;
-	struct RECORD_PAGE_HEADER *record;
+	RECORD_PAGE_HEADER *record;
 	unsigned int j;
 	BOOL err;
 	unsigned int used;
@@ -218,8 +224,8 @@ static int replaceusa(struct BUFFER *buffer, unsigned int lth)
 			/* Do not check beyond used sectors */
 		record = &buffer->block.record;
 		used = blocksz;
-		xusa = le16_to_cpu(record->head.usa_ofs);
-		nusa = le16_to_cpu(record->head.usa_count);
+		xusa = le16_to_cpu(record->usa_ofs);
+		nusa = le16_to_cpu(record->usa_count);
 		if (xusa && nusa
 		   && ((xusa + 1) < lth)
 		   && ((nusa - 1)*NTFSBLKLTH == lth)) {
@@ -317,18 +323,22 @@ static const struct BUFFER *read_buffer(CONTEXT *ctx, unsigned int num)
 {
 	struct BUFFER *buffer;
 	BOOL got;
+	int k;
+	unsigned int rnum;
 
 		/*
 		 * The first four blocks are stored apart, to make
 		 * sure pages 2 and 3 and the page which is logically
 		 * before them can be accessed at the same time.
+		 * (Only two blocks are stored apart if version >= 2.0)
 		 * Also, block 0 is smaller because it has to be read
 		 * before the block size is known.
 		 * Note : the last block is supposed to have an odd
-		 * number, and cannot be overwritten by block 4 which
-		 * follows logically.
+		 * number, and cannot be overwritten by block 4 (or 34
+		 * if version >= 2.0) which follows logically.
 		 */
-	if (num < BASEBLKS)
+	if ((num < RSTBLKS)
+	    || ((log_major < 2) && (num < BASEBLKS)))
 		buffer = buffer_table[num + BUFFERCNT];
 	else
 		buffer = buffer_table[num & (BUFFERCNT - 1)];
@@ -340,30 +350,37 @@ static const struct BUFFER *read_buffer(CONTEXT *ctx, unsigned int num)
 		buffer = (struct BUFFER*)
 			malloc(sizeof(struct BUFFER) + blocksz);
 		buffer->size = blocksz;
-		buffer->num = num + 1; /* forced to being read */
+		buffer->rnum = num + 1; /* forced to being read */
 		buffer->safe = FALSE;
 		if (num < BASEBLKS)
 			buffer_table[num + BUFFERCNT] = buffer;
 		else
 			buffer_table[num & (BUFFERCNT - 1)] = buffer;
 	}
-	if (buffer && (buffer->num != num)) {
+	rnum = num;
+	if (log_major >= 2) {
+		for (k=RSTBLKS; k<BASEBLKS2; k++)
+			if (redirect[k] == num)
+				rnum = k;
+	}
+	if (buffer && (buffer->rnum != rnum)) {
 		buffer->num = num;
+		buffer->rnum = rnum;
 		if (ctx->vol)
-			got = (ntfs_attr_pread(log_na,(u64)num << blockbits,
+			got = (ntfs_attr_pread(log_na,(u64)rnum << blockbits,
                 		blocksz, buffer->block.data) == blocksz);
 		else
-			got = !fseek(ctx->file, loclogblk(ctx, num), 0)
+			got = !fseek(ctx->file, loclogblk(ctx, rnum), 0)
 			    && (fread(buffer->block.data, blocksz,
 						1, ctx->file) == 1);
 		if (got) {
 			char *data = buffer->block.data;
-			buffer->headsz = sizeof(struct RECORD_PAGE_HEADER)
+			buffer->headsz = sizeof(RECORD_PAGE_HEADER)
 				+ ((2*getle16(data,6) - 1) | 7) + 1;
 			buffer->safe = !replaceusa(buffer, blocksz);
 		} else {
 			buffer->safe = FALSE;
-			fprintf(stderr,"** Could not read block %d\n", num);
+			fprintf(stderr,"** Could not read block %d\n", rnum);
 		}
 	}
 	return (buffer && buffer->safe ? buffer : (const struct BUFFER*)NULL);
@@ -794,7 +811,7 @@ static BOOL acts_on_mft(int op)
 	return (onmft);
 }
 
-u32 get_undo_offset(const struct LOG_RECORD *logr)
+u32 get_undo_offset(const LOG_RECORD *logr)
 {
 	u32 offset;
 
@@ -805,7 +822,7 @@ u32 get_undo_offset(const struct LOG_RECORD *logr)
 	return (offset);
 }
 
-u32 get_redo_offset(const struct LOG_RECORD *logr)
+u32 get_redo_offset(const LOG_RECORD *logr)
 {
 	u32 offset;
 
@@ -816,7 +833,7 @@ u32 get_redo_offset(const struct LOG_RECORD *logr)
 	return (offset);
 }
 
-u32 get_extra_offset(const struct LOG_RECORD *logr)
+u32 get_extra_offset(const LOG_RECORD *logr)
 {
 	u32 uoffset;
 	u32 roffset;
@@ -828,11 +845,11 @@ u32 get_extra_offset(const struct LOG_RECORD *logr)
 	return ((((uoffset > roffset ? uoffset : roffset) - 1) | 7) + 1);
 }
 
-static BOOL likelyop(const struct LOG_RECORD *logr)
+static BOOL likelyop(const LOG_RECORD *logr)
 {
 	BOOL likely;
 
-	switch (le32_to_cpu(logr->record_type)) {
+	switch (logr->record_type) {
 	case LOG_STANDARD : /* standard record */
 	     /* Operations in range 0..LastAction-1, can be both null */
 		likely = ((unsigned int)le16_to_cpu(logr->redo_operation)
@@ -914,7 +931,7 @@ static BOOL likelyop(const struct LOG_RECORD *logr)
 
 static u16 searchlikely(const struct BUFFER *buf)
 {
-	const struct LOG_RECORD *logr;
+	const LOG_RECORD *logr;
 	const char *data;
 	u16 k;
 
@@ -922,11 +939,11 @@ static u16 searchlikely(const struct BUFFER *buf)
 		printf("** Error : searchlikely() used for syncing\n");
         data = buf->block.data;
    	k = buf->headsz;
-	logr = (const struct LOG_RECORD*)&data[k];
+	logr = (const LOG_RECORD*)&data[k];
 	if (!likelyop(logr)) {
 		do {
 			k += 8;
-			logr = (const struct LOG_RECORD*)&data[k];
+			logr = (const LOG_RECORD*)&data[k];
 		} while ((k <= (blocksz - LOG_RECORD_HEAD_SZ))
 		    && !likelyop(logr));
 		if (k > (blocksz - LOG_RECORD_HEAD_SZ))
@@ -954,9 +971,9 @@ static u16 searchlikely(const struct BUFFER *buf)
 static u16 firstrecord(int skipped, const struct BUFFER *buf,
 		   const struct BUFFER *prevbuf)
 {
-	const struct RECORD_PAGE_HEADER *rph;
-	const struct RECORD_PAGE_HEADER *prevrph;
-	const struct LOG_RECORD *logr;
+	const RECORD_PAGE_HEADER *rph;
+	const RECORD_PAGE_HEADER *prevrph;
+	const LOG_RECORD *logr;
 	const char *data;
 	const char *prevdata;
 	u16 k;
@@ -978,7 +995,7 @@ static u16 firstrecord(int skipped, const struct BUFFER *buf,
 		k = 0;
 		/* Minimal size is apparently 48 : offset of redo_operation */
 	if (k && ((blocksz - k) >= LOG_RECORD_HEAD_SZ)) {
-		logr = (const struct LOG_RECORD*)&prevdata[k];
+		logr = (const LOG_RECORD*)&prevdata[k];
 		if (!logr->client_data_length) {
 			/*
 			 * Sometimes the end of record is free space.
@@ -1051,7 +1068,7 @@ static u16 firstrecord(int skipped, const struct BUFFER *buf,
 		 * try to find a starting record.
 		 */
 	if (k && prevbuf && (prevbuf->num > buf->num)) {
-		logr = (const struct LOG_RECORD*)&data[k];
+		logr = (const LOG_RECORD*)&data[k];
 			/* Accept reaching the end with no record beginning */
 		if ((k != le16_to_cpu(rph->next_record_offset))
 		    && !likelyop(logr)) {
@@ -1081,7 +1098,7 @@ static const struct BUFFER *findprevious(CONTEXT *ctx, const struct BUFFER *buf)
 {
 	const struct BUFFER *prevbuf;
 	const struct BUFFER *savebuf;
-	const struct RECORD_PAGE_HEADER *rph;
+	const RECORD_PAGE_HEADER *rph;
 	int skipped;
 	int prevblk;
 	BOOL prevmiddle;
@@ -1094,22 +1111,30 @@ static const struct BUFFER *findprevious(CONTEXT *ctx, const struct BUFFER *buf)
 	skipped = 0;
 	do {
 		prevmiddle = FALSE;
-		if (prevblk > BASEBLKS)
+		if (prevblk > (log_major < 2 ? BASEBLKS : BASEBLKS2))
 			prevblk--;
 		else
-			if (prevblk == BASEBLKS)
+			if (prevblk == (log_major < 2 ? BASEBLKS : BASEBLKS2))
 				prevblk = (logfilesz >> blockbits) - 1;
 			else {
 				rph = &buf->block.record;
-				prevblk = (le32_to_cpu(rph->copy.file_offset)
+				if (log_major < 2)
+					prevblk = (sle64_to_cpu(
+						rph->copy.file_offset)
 							>> blockbits) - 1;
+				else
+					prevblk = (sle64_to_cpu(
+						rph->copy.last_lsn)
+						    & offset_mask)
+							>> (blockbits - 3);
 				/*
 				 * If an initial block leads to block 4, it
 				 * can mean the last block or no previous
 				 * block at all. Using the last block is safer,
 				 * its lsn will indicate whether it is stale.
 				 */
-				if (prevblk < BASEBLKS)
+				if (prevblk
+				    < (log_major < 2 ? BASEBLKS : BASEBLKS2))
 					prevblk = (logfilesz >> blockbits) - 1;
 			}
 		/* No previous block if the log only consists of block 2 or 3 */
@@ -1148,18 +1173,18 @@ static const struct BUFFER *findprevious(CONTEXT *ctx, const struct BUFFER *buf)
 
 void copy_attribute(struct ATTR *pa, const char *buf, int length)
 {
-	const struct ATTR_NEW *panew;
-	struct ATTR_OLD old_aligned;
+	const ATTR_NEW *panew;
+	ATTR_OLD old_aligned;
 
 	if (pa) {
 		switch (length) {
-		case sizeof(struct ATTR_NEW) :
-			panew = (const struct ATTR_NEW*)buf;
+		case sizeof(ATTR_NEW) :
+			panew = (const ATTR_NEW*)buf;
 			pa->type = panew->type;
 			pa->lsn = sle64_to_cpu(panew->lsn);
 			pa->inode = MREF(le64_to_cpu(panew->inode));
 			break;
-		case sizeof(struct ATTR_OLD) :
+		case sizeof(ATTR_OLD) :
 				/* Badly aligned, first realign */
 			memcpy(&old_aligned,buf,sizeof(old_aligned));
 			pa->type = old_aligned.type;
@@ -1176,7 +1201,7 @@ void copy_attribute(struct ATTR *pa, const char *buf, int length)
 static int refresh_attributes(const struct ACTION_RECORD *firstaction)
 {
 	const struct ACTION_RECORD *action;
-	const struct LOG_RECORD *logr;
+	const LOG_RECORD *logr;
 	struct ATTR *pa;
 	const char *buf;
 	u32 extra;
@@ -1267,7 +1292,7 @@ static int refresh_attributes(const struct ACTION_RECORD *firstaction)
  *              Display a fixup
  */
 
-static void fixup(CONTEXT *ctx, const struct LOG_RECORD *logr, const char *buf,
+static void fixup(CONTEXT *ctx, const LOG_RECORD *logr, const char *buf,
 				BOOL redo)
 {
 	struct ATTR *pa;
@@ -1320,7 +1345,7 @@ static void fixup(CONTEXT *ctx, const struct LOG_RECORD *logr, const char *buf,
 		}
 		printf("   new base MFT record, attr 0x%x (%s)\n",attr,attrname(attr));
 		printf("   inode      %lld\n",
-				(((long long)le32_to_cpu(logr->target_vcn)
+				(((long long)sle64_to_cpu(logr->target_vcn)
 					<< clusterbits)
 				+ (le16_to_cpu(logr->cluster_index) << 9))
 					>> mftrecbits);
@@ -1369,7 +1394,7 @@ static void fixup(CONTEXT *ctx, const struct LOG_RECORD *logr, const char *buf,
 		printf("   free base MFT record, attr 0x%x (%s)\n",
 				attr,attrname(attr));
 		printf("   inode %lld\n",
-		    (((long long)le32_to_cpu(logr->target_vcn) << clusterbits)
+		    (((long long)sle64_to_cpu(logr->target_vcn) << clusterbits)
 		    + (le16_to_cpu(logr->cluster_index) << 9)) >> mftrecbits);
 		break;
 	case CreateAttribute : /* 5 */
@@ -1758,8 +1783,8 @@ static void fixup(CONTEXT *ctx, const struct LOG_RECORD *logr, const char *buf,
 			     * Changed from Win10, formerly we got step = 44.
 			     * The record layout has also changed
 			     */
-			if ((step != sizeof(struct ATTR_OLD))
-			    && (step != sizeof(struct ATTR_NEW))) {
+			if ((step != sizeof(ATTR_OLD))
+			    && (step != sizeof(ATTR_NEW))) {
 				printf("   ** Unexpected step %d\n",step);
 			}
 			more = 0;
@@ -1832,7 +1857,7 @@ static void fixup(CONTEXT *ctx, const struct LOG_RECORD *logr, const char *buf,
 	}
 }
 
-static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
+static void detaillogr(CONTEXT *ctx, const LOG_RECORD *logr)
 {
 	u64 lcn;
 	u64 baselcn;
@@ -1845,8 +1870,8 @@ static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
 	unsigned int listsize;
 	BOOL onmft;
 
-	switch (le32_to_cpu(logr->record_type)) {
-	case 1 :
+	switch (logr->record_type) {
+	case LOG_STANDARD :
 		onmft = logr->cluster_index
 			|| acts_on_mft(le16_to_cpu(logr->redo_operation))
 			|| acts_on_mft(le16_to_cpu(logr->undo_operation));
@@ -1877,23 +1902,21 @@ static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
 		printf("attribute_flags        %04x\n",
 			(int)le16_to_cpu(logr->attribute_flags));
 		if (mftrecbits && onmft)
-			printf("target_vcn             %08lx (inode %lld)\n",
-				(long)le32_to_cpu(logr->target_vcn),
-				(((long long)le32_to_cpu(logr->target_vcn)
+			printf("target_vcn             %016llx (inode %lld)\n",
+				(long long)sle64_to_cpu(logr->target_vcn),
+				(((long long)sle64_to_cpu(logr->target_vcn)
 					<< clusterbits)
 				+ (le16_to_cpu(logr->cluster_index) << 9))
 					 >> mftrecbits);
 		else
-			printf("target_vcn             %08lx\n",
-				(long)le32_to_cpu(logr->target_vcn));
-		printf("reserved3              %08lx\n",
-				(long)le32_to_cpu(logr->reserved3));
+			printf("target_vcn             %016llx\n",
+				(long long)sle64_to_cpu(logr->target_vcn));
 			/* Compute a base for the current run of mft */
-		baselcn = le64_to_cpu(logr->lcn_list[0])
-					- le32_to_cpu(logr->target_vcn);
+		baselcn = sle64_to_cpu(logr->lcn_list[0])
+					- sle64_to_cpu(logr->target_vcn);
 		for (i=0; i<le16_to_cpu(logr->lcns_to_follow)
 						&& (i<SHOWLISTS); i++) {
-			lcn = le64_to_cpu(logr->lcn_list[i]);
+			lcn = sle64_to_cpu(logr->lcn_list[i]);
 			printf("  (%d offs 0x%x) lcn    %016llx",i,
 				(int)(8*i + sizeof(LOG_RECORD) - 8),
 				(long long)lcn);
@@ -1992,7 +2015,7 @@ static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
                   off = le16_to_cpu(logr->record_offset)
 					+ le16_to_cpu(logr->attribute_offset);
                   printf("redo data (new data) cluster 0x%llx pos 0x%x :\n",
-                        (long long)le64_to_cpu(logr->lcn_list[off
+                        (long long)sle64_to_cpu(logr->lcn_list[off
 						>> clusterbits]),
                         (int)(off & (clustersz - 1)));
                   }
@@ -2021,7 +2044,7 @@ static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
                    off = le16_to_cpu(logr->record_offset)
 					+ le16_to_cpu(logr->attribute_offset);
                    printf("undo data (old data) cluster 0x%llx pos 0x%x :\n",
-                         (long long)le64_to_cpu(logr->lcn_list[off
+                         (long long)sle64_to_cpu(logr->lcn_list[off
 							>> clusterbits]),
                          (int)(off & (clustersz - 1)));
                    }
@@ -2068,7 +2091,7 @@ static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
                 printf("* undo data overflows from record\n");
 	    }
          	break;
-	case 2 :
+	case LOG_CHECKPOINT :
 		printf("---> checkpoint record\n");
 		printf("redo_operation         %04x %s\n",
 			(int)le16_to_cpu(logr->redo_operation),
@@ -2090,7 +2113,7 @@ static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
 			(long long)sle64_to_cpu(logr->dirty_pages_lsn));
 		listsize = le32_to_cpu(logr->client_data_length)
 				+ LOG_RECORD_HEAD_SZ
-				- offsetof(struct LOG_RECORD, unknown_list);
+				- offsetof(LOG_RECORD, unknown_list);
 		if (listsize > 8*SHOWLISTS)
 			listsize = 8*SHOWLISTS;
 		for (i=0; 8*i<listsize; i++)
@@ -2110,17 +2133,17 @@ static void detaillogr(CONTEXT *ctx, const struct LOG_RECORD *logr)
 	}
 }
 
-BOOL within_lcn_range(const struct LOG_RECORD *logr)
+BOOL within_lcn_range(const LOG_RECORD *logr)
 {
 	u64 lcn;
 	unsigned int i;
 	BOOL within;
 
 	within = FALSE;
-   	switch (le32_to_cpu(logr->record_type)) {
-      	case 1 :
+   	switch (logr->record_type) {
+      	case LOG_STANDARD :
          	for (i=0; i<le16_to_cpu(logr->lcns_to_follow); i++) {
-            		lcn = MREF(le64_to_cpu(logr->lcn_list[i]));
+			lcn = MREF(sle64_to_cpu(logr->lcn_list[i]));
 			if ((lcn >= firstlcn) && (lcn <= lastlcn))
 				within = TRUE;
 		}
@@ -2131,7 +2154,7 @@ BOOL within_lcn_range(const struct LOG_RECORD *logr)
 	return (within);
 }
 
-static void showlogr(CONTEXT *ctx, int k, const struct LOG_RECORD *logr)
+static void showlogr(CONTEXT *ctx, int k, const LOG_RECORD *logr)
 {
 	s32 diff;
 
@@ -2158,15 +2181,15 @@ static void showlogr(CONTEXT *ctx, int k, const struct LOG_RECORD *logr)
 		printf("log_record_flags       %04x\n",
 			(int)le16_to_cpu(logr->log_record_flags));
 		printf("reserved1              %04x %04x %04x\n",
-			(int)le16_to_cpu(logr->reserved1[0]),
-		(int)le16_to_cpu(logr->reserved1[1]),
-		(int)le16_to_cpu(logr->reserved1[2]));
+			(int)le16_to_cpu(logr->reserved_or_alignment[0]),
+		(int)le16_to_cpu(logr->reserved_or_alignment[1]),
+		(int)le16_to_cpu(logr->reserved_or_alignment[2]));
 		detaillogr(ctx, logr);
 	}
 	if (optt) {
 		const char *state;
 
-		if (logr->record_type == const_cpu_to_le32(2))
+		if (logr->record_type == LOG_CHECKPOINT)
 			state = "--checkpoint--";
 		else
 			state = commitment(sle64_to_cpu(logr->this_lsn));
@@ -2206,7 +2229,7 @@ static void showlogr(CONTEXT *ctx, int k, const struct LOG_RECORD *logr)
 static void mark_transactions(struct ACTION_RECORD *lastaction)
 {
 	struct ACTION_RECORD *action;
-	const struct LOG_RECORD *logr;
+	const LOG_RECORD *logr;
 	le32 id;
 	int actives;
 	BOOL more;
@@ -2263,7 +2286,7 @@ static void mark_transactions(struct ACTION_RECORD *lastaction)
  *		Enqueue an action and play the queued actions on end of set
  */
 
-static TRISTATE enqueue_action(CONTEXT *ctx, const struct LOG_RECORD *logr,
+static TRISTATE enqueue_action(CONTEXT *ctx, const LOG_RECORD *logr,
 				int size, int num)
 {
 	struct ACTION_RECORD *action;
@@ -2290,7 +2313,7 @@ static TRISTATE enqueue_action(CONTEXT *ctx, const struct LOG_RECORD *logr,
 		err = 0;
 		state = T_OK;
 		if ((optp || optu)
-		    && (logr->record_type == const_cpu_to_le32(2))) {
+		    && (logr->record_type == LOG_CHECKPOINT)) {
 			/* if chkp process queue, and increment count */
 			playedactions++;
 			if (playedactions <= playcount) {
@@ -2359,20 +2382,20 @@ static TRISTATE enqueue_action(CONTEXT *ctx, const struct LOG_RECORD *logr,
 }
 
 
-static void showheadrcrd(u32 blk, const struct RECORD_PAGE_HEADER *rph)
+static void showheadrcrd(u32 blk, const RECORD_PAGE_HEADER *rph)
 {
 	s32 diff;
 
 	if (optv) {
 		printf("magic              %08lx\n",
-			(long)le32_to_cpu(rph->head.magic));
+			(long)le32_to_cpu(rph->magic));
 		printf("usa_ofs            %04x\n",
-			(int)le16_to_cpu(rph->head.usa_ofs));
+			(int)le16_to_cpu(rph->usa_ofs));
 		printf("usa_count          %04x\n",
-			(int)le16_to_cpu(rph->head.usa_count));
+			(int)le16_to_cpu(rph->usa_count));
 		if (blk < 4)
-			printf("file_offset        %08lx\n",
-				(long)le32_to_cpu(rph->copy.file_offset));
+			printf("file_offset        %016llx\n",
+				(long long)sle64_to_cpu(rph->copy.file_offset));
 		else {
 			diff = sle64_to_cpu(rph->copy.last_lsn) - synced_lsn;
 			printf("last_lsn           %016llx"
@@ -2389,15 +2412,15 @@ static void showheadrcrd(u32 blk, const struct RECORD_PAGE_HEADER *rph)
 		printf("next_record_offset %04x\n",
 			(int)le16_to_cpu(rph->next_record_offset));
 		printf("reserved4          %04x %04x %04x\n",
-			(int)le16_to_cpu(rph->reserved4[0]),
-			(int)le16_to_cpu(rph->reserved4[1]),
-			(int)le16_to_cpu(rph->reserved4[2]));
+			(int)le16_to_cpu(rph->reserved[0]),
+			(int)le16_to_cpu(rph->reserved[1]),
+			(int)le16_to_cpu(rph->reserved[2]));
 		diff = sle64_to_cpu(rph->last_end_lsn) - synced_lsn;
 		printf("last_end_lsn       %016llx (synced%s%ld)\n",
 			(long long)sle64_to_cpu(rph->last_end_lsn),
 			(diff < 0 ? "" : "+"),(long)diff);
 		printf("usn                %04x\n",
-			(int)getle16(rph,le16_to_cpu(rph->head.usa_ofs)));
+			(int)getle16(rph,le16_to_cpu(rph->usa_ofs)));
 		printf("\n");
 	} else {
 		if (optt) {
@@ -2430,7 +2453,7 @@ static void showheadrcrd(u32 blk, const struct RECORD_PAGE_HEADER *rph)
 static u16 overlapshow(CONTEXT *ctx, u16 k, u32 blk, const struct BUFFER *buf,
 			const struct BUFFER *nextbuf)
 {
-	const struct LOG_RECORD *logr;
+	const LOG_RECORD *logr;
 	const char *data;
 	const char *nextdata;
 	char *fullrec;
@@ -2441,7 +2464,7 @@ static u16 overlapshow(CONTEXT *ctx, u16 k, u32 blk, const struct BUFFER *buf,
 	u16 blkheadsz;
 
 	data = buf->block.data;
-	logr = (const struct LOG_RECORD*)&data[k];
+	logr = (const LOG_RECORD*)&data[k];
 	size = le32_to_cpu(logr->client_data_length) + LOG_RECORD_HEAD_SZ;
 	blkheadsz = buf->headsz;
 	if (nextbuf && (blk >= BASEBLKS)) {
@@ -2457,7 +2480,7 @@ static u16 overlapshow(CONTEXT *ctx, u16 k, u32 blk, const struct BUFFER *buf,
 				memcpy(&fullrec[space],
 					nextdata + blkheadsz,
 					size - space);
-				likely = likelyop((struct LOG_RECORD*)fullrec);
+				likely = likelyop((LOG_RECORD*)fullrec);
 				actionnum++;
 				if (optv) {
 					printf("\nOverlapping record %u at 0x%x"
@@ -2470,7 +2493,7 @@ static u16 overlapshow(CONTEXT *ctx, u16 k, u32 blk, const struct BUFFER *buf,
 				}
 				if (likely)
 					showlogr(ctx, k,
-						(struct LOG_RECORD*)fullrec);
+						(LOG_RECORD*)fullrec);
 				else
 					printf("** Skipping unlikely"
 						" overlapping record\n");
@@ -2523,7 +2546,7 @@ static u16 overlapshow(CONTEXT *ctx, u16 k, u32 blk, const struct BUFFER *buf,
 						size - pos);
 				else
 					likely = FALSE;
-				if (!likelyop((struct LOG_RECORD*)fullrec))
+				if (!likelyop((LOG_RECORD*)fullrec))
 					likely = FALSE;
 				actionnum++;
 				if (optv) {
@@ -2537,7 +2560,7 @@ static u16 overlapshow(CONTEXT *ctx, u16 k, u32 blk, const struct BUFFER *buf,
 				}
 				if (likely)
 					showlogr(ctx, k,
-						(struct LOG_RECORD*)fullrec);
+						(LOG_RECORD*)fullrec);
 				else
 					printf("** Skipping unlikely"
 						" overlapping record\n");
@@ -2589,15 +2612,15 @@ static u16 overlapshow(CONTEXT *ctx, u16 k, u32 blk, const struct BUFFER *buf,
 static u16 forward_rcrd(CONTEXT *ctx, u32 blk, u16 pos,
 			const struct BUFFER *buf, const struct BUFFER *nextbuf)
 {
-	const struct RECORD_PAGE_HEADER *rph;
-	const struct LOG_RECORD *logr;
+	const RECORD_PAGE_HEADER *rph;
+	const LOG_RECORD *logr;
 	const char *data;
 	u16 k;
 	u16 endoff;
 	BOOL stop;
 
 	rph = &buf->block.record;
-	if (rph && (rph->head.magic == magic_RCRD)) {
+	if (rph && (rph->magic == magic_RCRD)) {
 		data = buf->block.data;
 		showheadrcrd(blk, rph);
 		k = buf->headsz;
@@ -2605,19 +2628,19 @@ static u16 forward_rcrd(CONTEXT *ctx, u32 blk, u16 pos,
 			k = ((pos - 1) | 7) + 1;
 		}
 // TODO check bad start > blocksz - 48
-		logr = (const struct LOG_RECORD*)&data[k];
+		logr = (const LOG_RECORD*)&data[k];
 		stop = FALSE;
 		if (!likelyop(logr)) {
 			if (optv)
 				printf("* Bad start 0x%x for block %d\n",
 					(int)pos,(int)blk);
 			k = searchlikely(buf);
-			if ((k + sizeof(struct LOG_RECORD)) > blocksz) {
+			if ((k + sizeof(LOG_RECORD)) > blocksz) {
 				printf("No likely full record in block %lu\n",
 						(unsigned long)blk);
 		      /* there can be a partial one */
 				k = le16_to_cpu(rph->next_record_offset);
-				if ((k < (u16)sizeof(struct RECORD_PAGE_HEADER))
+				if ((k < (u16)sizeof(RECORD_PAGE_HEADER))
 				    || ((blocksz - k) < LOG_RECORD_HEAD_SZ))
 					stop = TRUE;
 			} else {
@@ -2629,7 +2652,7 @@ static u16 forward_rcrd(CONTEXT *ctx, u32 blk, u16 pos,
 		while (!stop) {
 			s32 size;
 
-			logr = (const struct LOG_RECORD*)&data[k];
+			logr = (const LOG_RECORD*)&data[k];
 			size = le32_to_cpu(logr->client_data_length)
 						+ LOG_RECORD_HEAD_SZ;
 			if ((size < MINRECSIZE)
@@ -2674,7 +2697,7 @@ static u16 forward_rcrd(CONTEXT *ctx, u32 blk, u16 pos,
 		}
 	} else {
 		printf("** Not a RCRD record, MAGIC 0x%08lx\n",
-			(long)le32_to_cpu(rph->head.magic));
+			(long)le32_to_cpu(rph->magic));
 		k = 0;
 	}
 	return (k);
@@ -2684,34 +2707,34 @@ static u16 forward_rcrd(CONTEXT *ctx, u32 blk, u16 pos,
  *                Display a restart page
  */
 
-static void showrest(const struct RESTART_PAGE_HEADER *rest)
+static void showrest(const RESTART_PAGE_HEADER *rest)
 {
-	const struct RESTART_AREA *resa;
-	const struct RESTART_CLIENT *rcli;
+	const RESTART_AREA *resa;
+	const LOG_CLIENT_RECORD *rcli;
 	const char *data;
 
 	data = (const char*)rest;
-	if ((rest->head.magic == magic_RSTR)
-			|| (rest->head.magic == magic_CHKD)) {
+	if ((rest->magic == magic_RSTR)
+			|| (rest->magic == magic_CHKD)) {
 		if (optv) {
 			printf("magic                  %08lx\n",
-				(long)le32_to_cpu(rest->head.magic));
+				(long)le32_to_cpu(rest->magic));
 			printf("usa_ofs                %04x\n",
-				(int)le16_to_cpu(rest->head.usa_ofs));
+				(int)le16_to_cpu(rest->usa_ofs));
 			printf("usa_count              %04x\n",
-				(int)le16_to_cpu(rest->head.usa_count));
+				(int)le16_to_cpu(rest->usa_count));
 			printf("chkdsk_lsn             %016llx\n",
 				(long long)sle64_to_cpu(rest->chkdsk_lsn));
 			printf("system_page_size       %08lx\n",
 				(long)le32_to_cpu(rest->system_page_size));
 			printf("log_page_size          %08lx\n",
 				(long)le32_to_cpu(rest->log_page_size));
-			printf("restart_offset         %04x\n",
-				(int)le16_to_cpu(rest->restart_offset));
+			printf("restart_area_offset    %04x\n",
+				(int)le16_to_cpu(rest->restart_area_offset));
 			printf("minor_vers             %d\n",
-				(int)le16_to_cpu(rest->minor_ver));
+				(int)sle16_to_cpu(rest->minor_ver));
 			printf("major_vers             %d\n",
-				(int)le16_to_cpu(rest->major_ver));
+				(int)sle16_to_cpu(rest->major_ver));
 			printf("usn                    %04x\n",
 				(int)le16_to_cpu(rest->usn));
 			printf("\n");
@@ -2720,8 +2743,8 @@ static void showrest(const struct RESTART_PAGE_HEADER *rest)
 				printf("    chkdsk         %016llx\n",
 				    (long long)sle64_to_cpu(rest->chkdsk_lsn));
 		}
-		resa = (const struct RESTART_AREA*)
-				&data[le16_to_cpu(rest->restart_offset)];
+		resa = (const RESTART_AREA*)
+				&data[le16_to_cpu(rest->restart_area_offset)];
 		if (optv) {
 			printf("current_lsn            %016llx\n",
 				(long long)sle64_to_cpu(resa->current_lsn));
@@ -2740,11 +2763,11 @@ static void showrest(const struct RESTART_PAGE_HEADER *rest)
 			printf("client_array_offset    %04x\n",
 				(int)le16_to_cpu(resa->client_array_offset));
 			printf("file_size              %016llx\n",
-				(long long)le64_to_cpu(resa->file_size));
+				(long long)sle64_to_cpu(resa->file_size));
 			printf("last_lsn_data_len      %08lx\n",
 				(long)le32_to_cpu(resa->last_lsn_data_length));
 			printf("record_length          %04x\n",
-				(int)le16_to_cpu(resa->record_length));
+				(int)le16_to_cpu(resa->log_record_header_length));
 			printf("log_page_data_offs     %04x\n",
 				(int)le16_to_cpu(resa->log_page_data_offset));
 			printf("restart_log_open_count %08lx\n",
@@ -2756,8 +2779,8 @@ static void showrest(const struct RESTART_PAGE_HEADER *rest)
 				    (long long)sle64_to_cpu(resa->current_lsn));
 		}
 
-		rcli = (const struct RESTART_CLIENT*)
-				&data[le16_to_cpu(rest->restart_offset)
+		rcli = (const LOG_CLIENT_RECORD*)
+				&data[le16_to_cpu(rest->restart_area_offset)
 				+ le16_to_cpu(resa->client_array_offset)];
 		if (optv) {
 			printf("oldest_lsn             %016llx\n",
@@ -2787,14 +2810,14 @@ static void showrest(const struct RESTART_PAGE_HEADER *rest)
 		}
 	} else
 		printf("Not a RSTR or CHKD record, MAGIC 0x%08lx\n",
-			(long)le32_to_cpu(rest->head.magic));
+			(long)le32_to_cpu(rest->magic));
 }
 
 static BOOL dorest(CONTEXT *ctx, unsigned long blk,
-			const struct RESTART_PAGE_HEADER *rph, BOOL initial)
+			const RESTART_PAGE_HEADER *rph, BOOL initial)
 {
-	const struct RESTART_AREA *resa;
-	const struct RESTART_CLIENT *rcli;
+	const RESTART_AREA *resa;
+	const LOG_CLIENT_RECORD *rcli;
 	const char *data;
 	s64 diff;
 	int offs;
@@ -2803,9 +2826,9 @@ static BOOL dorest(CONTEXT *ctx, unsigned long blk,
 	BOOL dirty;
 
 	data = (const char*)rph;
-	offs = le16_to_cpu(rph->restart_offset);
-	resa = (const struct RESTART_AREA*)&data[offs];
-	rcli = (const struct RESTART_CLIENT*)&data[offs
+	offs = le16_to_cpu(rph->restart_area_offset);
+	resa = (const RESTART_AREA*)&data[offs];
+	rcli = (const LOG_CLIENT_RECORD*)&data[offs
 				+ le16_to_cpu(resa->client_array_offset)];
 	if (initial) {
 		/* Information from block initially found best */
@@ -2813,13 +2836,13 @@ static BOOL dorest(CONTEXT *ctx, unsigned long blk,
 		committed_lsn = sle64_to_cpu(rcli->client_restart_lsn);
 		synced_lsn = sle64_to_cpu(rcli->oldest_lsn);
 		memcpy(&log_header, rph,
-				sizeof(struct RESTART_PAGE_HEADER));
-		offs = le16_to_cpu(log_header.restart_offset);
+				sizeof(RESTART_PAGE_HEADER));
+		offs = le16_to_cpu(log_header.restart_area_offset);
 		memcpy(&restart, &data[offs],
-				sizeof(struct RESTART_AREA));
+				sizeof(RESTART_AREA));
 		offs += le16_to_cpu(restart.client_array_offset);
 		memcpy(&client, &data[offs],
-				sizeof(struct RESTART_CLIENT));
+				sizeof(LOG_CLIENT_RECORD));
 		dirty = !(resa->flags & RESTART_VOLUME_IS_CLEAN);
 		if (optv || optt)
 			printf("* Using initial restart page,"
@@ -2859,13 +2882,13 @@ static BOOL dorest(CONTEXT *ctx, unsigned long blk,
 			synced_lsn = sle64_to_cpu(rcli->oldest_lsn);
 			latest_lsn = sle64_to_cpu(resa->current_lsn);
 			memcpy(&log_header, rph,
-					sizeof(struct RESTART_PAGE_HEADER));
-			offs = le16_to_cpu(log_header.restart_offset);
+					sizeof(RESTART_PAGE_HEADER));
+			offs = le16_to_cpu(log_header.restart_area_offset);
 			memcpy(&restart, &data[offs],
-					sizeof(struct RESTART_AREA));
+					sizeof(RESTART_AREA));
 			offs += le16_to_cpu(restart.client_array_offset);
 			memcpy(&client, &data[offs],
-					sizeof(struct RESTART_CLIENT));
+					sizeof(LOG_CLIENT_RECORD));
 			dirty = !(resa->flags & RESTART_VOLUME_IS_CLEAN);
 			if (optv || optt)
 				printf("* Using %s restart page,"
@@ -2876,6 +2899,8 @@ static BOOL dorest(CONTEXT *ctx, unsigned long blk,
 		}
 	}
 	restart_lsn = synced_lsn;
+	offset_mask = ((u64)1 << (64 - le32_to_cpu(restart.seq_number_bits)))
+				- (1 << (blockbits - 3));
 	return (dirty);
 }
 
@@ -2895,12 +2920,17 @@ static const struct BUFFER *read_restart(CONTEXT *ctx)
 {
 	const struct BUFFER *buf;
 	BOOL bad;
+	int blk;
+	int major, minor;
 
 	bad = FALSE;
+	for (blk=0; blk<BASEBLKS2; blk++)
+		redirect[blk] = 0;
+	log_major = 0; /* needed for reading into a buffer */
 	if (ctx->vol) {
-		struct RESTART_PAGE_HEADER *rph;
+		RESTART_PAGE_HEADER *rph;
 
-		rph = (struct RESTART_PAGE_HEADER*)NULL;
+		rph = (RESTART_PAGE_HEADER*)NULL;
 		/* Full mode : use the restart page selected by the library */
 		if (ntfs_check_logfile(log_na, &rph)) {
 			/* rph is left unchanged for a wiped out log file */
@@ -2925,7 +2955,7 @@ static const struct BUFFER *read_restart(CONTEXT *ctx)
 	if (buf) {
 		NTFS_RECORD_TYPES magic;
 
-		magic = buf->block.restart.head.magic;
+		magic = buf->block.restart.magic;
 		switch (magic) {
 		case magic_RSTR :
 			break;
@@ -2944,13 +2974,23 @@ static const struct BUFFER *read_restart(CONTEXT *ctx)
 		}
 		if (!bad && !ctx->vol)
 			dorest(ctx, 0, &buf->block.restart, TRUE);
-		if ((buf->block.restart.major_ver != const_cpu_to_le16(1))
-		    || (buf->block.restart.minor_ver != const_cpu_to_le16(1))) {
-			printf("** Unsupported $LogFile version %d.%d\n",
-				le16_to_cpu(buf->block.restart.major_ver),
-				le16_to_cpu(buf->block.restart.minor_ver));
-			bad = TRUE;
-		}
+		major = sle16_to_cpu(buf->block.restart.major_ver);
+		minor = sle16_to_cpu(buf->block.restart.minor_ver);
+		if ((major == 2) && (minor == 0)) {
+			if (!optk) {
+				printf("** Fast restart mode detected,"
+						" data could be lost\n");
+				printf("   Use option --kill-fast-restart"
+						" to bypass\n");
+				bad = TRUE;
+			}
+		} else
+			if ((major != 1) || (minor != 1)) {
+				printf("** Unsupported $LogFile version %d.%d\n",
+					major, minor);
+				bad = TRUE;
+			}
+		log_major = major;
 		if (bad) {
 			buf = (const struct BUFFER*)NULL;
 		}
@@ -2975,14 +3015,17 @@ static int reset_logfile(CONTEXT *ctx __attribute__((unused)))
 		restart.client_in_use_list = LOGFILE_NO_CLIENT;
 		restart.flags |= RESTART_VOLUME_IS_CLEAN;
 		client.oldest_lsn = cpu_to_sle64(restart_lsn);
+		/* Set $LogFile version to 1.1 so that volume can be mounted */
+		log_header.major_ver = const_cpu_to_sle16(1);
+		log_header.minor_ver = const_cpu_to_sle16(1);
 		memcpy(buffer, &log_header,
-					sizeof(struct RESTART_PAGE_HEADER));
-		off = le16_to_cpu(log_header.restart_offset);
+					sizeof(RESTART_PAGE_HEADER));
+		off = le16_to_cpu(log_header.restart_area_offset);
 		memcpy(&buffer[off], &restart,
-					sizeof(struct RESTART_AREA));
+					sizeof(RESTART_AREA));
 		off += le16_to_cpu(restart.client_array_offset);
 		memcpy(&buffer[off], &client,
-					sizeof(struct RESTART_CLIENT));
+					sizeof(LOG_CLIENT_RECORD));
 		if (!ntfs_mst_pre_write_fixup((NTFS_RECORD*)buffer, blocksz)
 		    && (ntfs_attr_pwrite(log_na, 0,
                 		blocksz, buffer) == blocksz)
@@ -3002,8 +3045,8 @@ static const struct BUFFER *best_start(const struct BUFFER *buf,
 				const struct BUFFER *altbuf)
 {
 	const struct BUFFER *best;
-	const struct RECORD_PAGE_HEADER *head;
-	const struct RECORD_PAGE_HEADER *althead;
+	const RECORD_PAGE_HEADER *head;
+	const RECORD_PAGE_HEADER *althead;
 	s64 diff;
 
 	if (!buf || !altbuf)
@@ -3019,7 +3062,7 @@ static const struct BUFFER *best_start(const struct BUFFER *buf,
 		else
 			best = buf;
 	}
-	if (best && (best->block.record.head.magic != magic_RCRD))
+	if (best && (best->block.record.magic != magic_RCRD))
 		best = (const struct BUFFER*)NULL;
 	return (best);
 }
@@ -3109,18 +3152,37 @@ static int locatelogfile(CONTEXT *ctx)
 
 static BOOL getlogfiledata(CONTEXT *ctx, const char *boot)
 {
-	const struct RESTART_PAGE_HEADER *rph;
-	const struct RESTART_AREA *rest;
+	const RESTART_PAGE_HEADER *rph;
+	const RESTART_AREA *rest;
 	BOOL ok;
 	u32 off;
 	s64 size;
+	u32 system_page_size;
+	u32 log_page_size;
 
 	ok = FALSE;
 	fseek(ctx->file,0L,2);
 	size = ftell(ctx->file);
-	rph = (const struct RESTART_PAGE_HEADER*)boot;
-	off = le16_to_cpu(rph->restart_offset);
-	rest = (const struct RESTART_AREA*)&boot[off];
+	rph = (const RESTART_PAGE_HEADER*)boot;
+	off = le16_to_cpu(rph->restart_area_offset);
+	/*
+	 * If the system or log page sizes are smaller than the ntfs block size
+	 * or either is not a power of 2 we cannot handle this log file.
+	 */
+	system_page_size = le32_to_cpu(rph->system_page_size);
+	log_page_size = le32_to_cpu(rph->log_page_size);
+	if (system_page_size < NTFS_BLOCK_SIZE ||
+			log_page_size < NTFS_BLOCK_SIZE ||
+			system_page_size & (system_page_size - 1) ||
+			log_page_size & (log_page_size - 1)) {
+		printf("** Unsupported page size.\n");
+		goto out;
+	}
+	if (off & 7 || off > system_page_size) {
+		printf("** Inconsistent restart area offset.\n");
+		goto out;
+	}
+	rest = (const RESTART_AREA*)&boot[off];
 
 		/* estimate cluster size from log file size (unreliable) */
 	switch (le32_to_cpu(rest->seq_number_bits)) {
@@ -3143,6 +3205,7 @@ static BOOL getlogfiledata(CONTEXT *ctx, const char *boot)
 	mftrecsz = 0;
 	mftrecbits = 0;
 	ok = TRUE;
+out:
 	return (ok);
 }
 
@@ -3155,11 +3218,11 @@ static BOOL getlogfiledata(CONTEXT *ctx, const char *boot)
 
 static BOOL getvolumedata(CONTEXT *ctx, char *boot)
 {
-	const struct RESTART_AREA *rest;
+	const RESTART_AREA *rest;
 	BOOL ok;
 
 	ok = FALSE;
-	rest = (const struct RESTART_AREA*)NULL;
+	rest = (const RESTART_AREA*)NULL;
 	if (ctx->vol) {
 		getboot(boot);
 		mftlcn = ctx->vol->mft_lcn;
@@ -3173,8 +3236,9 @@ static BOOL getvolumedata(CONTEXT *ctx, char *boot)
 		if (ctx->file
 		    && (!memcmp(boot,"RSTR",4) || !memcmp(boot,"CHKD",4))) {
 			printf("* Assuming a log file copy\n");
-			getlogfiledata(ctx, boot);
-			ok = TRUE;
+			ok = getlogfiledata(ctx, boot);
+			if (!ok)
+				goto out;
 		} else
 			fprintf(stderr,"** Not an NTFS image or log file\n");
 		}
@@ -3188,6 +3252,7 @@ static BOOL getvolumedata(CONTEXT *ctx, char *boot)
 		if (le16_to_cpu(rest->client_in_use_list) > 1)
 			printf("** multiple clients not implemented\n");
 	}
+out:
 	return (ok);
 }
 
@@ -3224,15 +3289,19 @@ static BOOL open_volume(CONTEXT *ctx, const char *device_name)
 			/* This appears to be a log file */
 			ctx->vol = (ntfs_volume*)NULL;
 			ok = getvolumedata(ctx, boot.buf);
-		}
-		if (!ok)
+			if (!ok) {
+				fclose(ctx->file);
+				goto out;
+			}
+		} else {
 			fclose(ctx->file);
+		}
 	}
 	if (!ok) {
 		/* Not a log file, assume an ntfs device, mount it */
 		ctx->file = (FILE*)NULL;
 		ctx->vol = ntfs_mount(device_name,
-			((optp || optu || opts) && !optn
+			((optk || optp || optu || opts) && !optn
 				? NTFS_MNT_FORENSIC : NTFS_MNT_RDONLY));
 		if (ctx->vol) {
 			ok = getvolumedata(ctx, boot.buf);
@@ -3240,6 +3309,7 @@ static BOOL open_volume(CONTEXT *ctx, const char *device_name)
 				ntfs_umount(ctx->vol, TRUE);
 		}
 	}
+out:
 	return (ok);
 }
 
@@ -3267,7 +3337,7 @@ static u16 dorcrd(CONTEXT *ctx, u32 blk, u16 pos, const struct BUFFER *buf,
 static TRISTATE backoverlap(CONTEXT *ctx, int blk,
 			const char *data, const char *nextdata, int k)
 {
-	const struct LOG_RECORD *logr;
+	const LOG_RECORD *logr;
 	char *fullrec;
 	s32 size;
 	int space;
@@ -3275,11 +3345,11 @@ static TRISTATE backoverlap(CONTEXT *ctx, int blk,
 	TRISTATE state;
 	u16 blkheadsz;
 
-	logr = (const struct LOG_RECORD*)&data[k];
+	logr = (const LOG_RECORD*)&data[k];
 	state = T_ERR;
 	size = le32_to_cpu(logr->client_data_length) + LOG_RECORD_HEAD_SZ;
 	space = blocksz - k;
-	blkheadsz = sizeof(struct RECORD_PAGE_HEADER)
+	blkheadsz = sizeof(RECORD_PAGE_HEADER)
 			+ ((2*getle16(data,6) - 1) | 7) + 1;
 	nextspace = blocksz - blkheadsz;
 	if ((space >= LOG_RECORD_HEAD_SZ)
@@ -3303,7 +3373,8 @@ static TRISTATE backoverlap(CONTEXT *ctx, int blk,
 			mblk = blk + 1;
 			while (total < size) {
 				if (mblk >= (logfilesz >> blockbits))
-					mblk = BASEBLKS;
+					mblk = (log_major < 2 ? BASEBLKS
+							: BASEBLKS2);
 				more = size - total;
 				if (more > nextspace)
 					more = nextspace;
@@ -3318,7 +3389,7 @@ static TRISTATE backoverlap(CONTEXT *ctx, int blk,
 			}
 		}
 
-		state = (likelyop((struct LOG_RECORD*)fullrec) ? T_OK : T_ERR);
+		state = (likelyop((LOG_RECORD*)fullrec) ? T_OK : T_ERR);
 		actionnum++;
 		if (optv) {
 			printf("\nOverlapping backward action %d at 0x%x"
@@ -3330,10 +3401,10 @@ static TRISTATE backoverlap(CONTEXT *ctx, int blk,
 				(long)blk,(int)space,(state == T_OK));
 		}
 		if (state == T_OK) {
-			showlogr(ctx, k, (struct LOG_RECORD*)fullrec);
+			showlogr(ctx, k, (LOG_RECORD*)fullrec);
 			if (optp || optu || opts)
 				state = enqueue_action(ctx,
-						(struct LOG_RECORD*)fullrec,
+						(LOG_RECORD*)fullrec,
 						size, actionnum);
 		} else {
 			/* Try to go on unless playing actions */
@@ -3362,10 +3433,10 @@ static TRISTATE backward_rcrd(CONTEXT *ctx, u32 blk, int skipped,
                   const struct BUFFER *buf, const struct BUFFER *prevbuf,
                   const struct BUFFER *nextbuf)
 {
-	u16 poslist[75]; /* 4096/sizeof(struct LOG_RECORD) */
-	const struct RECORD_PAGE_HEADER *rph;
-	const struct RECORD_PAGE_HEADER *prevrph;
-	const struct LOG_RECORD *logr;
+	u16 poslist[75]; /* 4096/sizeof(LOG_RECORD) */
+	const RECORD_PAGE_HEADER *rph;
+	const RECORD_PAGE_HEADER *prevrph;
+	const LOG_RECORD *logr;
 	const char *data;
 	const char *nextdata;
 	BOOL stop;
@@ -3378,18 +3449,24 @@ static TRISTATE backward_rcrd(CONTEXT *ctx, u32 blk, int skipped,
 
 	state = T_ERR;
 	rph = &buf->block.record;
-	prevrph = (struct RECORD_PAGE_HEADER*)NULL;
+	prevrph = (RECORD_PAGE_HEADER*)NULL;
 	if (prevbuf)
 		prevrph = &prevbuf->block.record;
 	data = buf->block.data;
-	if (rph && (rph->head.magic == magic_RCRD)
-	    && (!prevrph || (prevrph->head.magic == magic_RCRD))) {
+	if (rph && (rph->magic == magic_RCRD)
+	    && (!prevrph || (prevrph->magic == magic_RCRD))) {
 		if (optv) {
 			if (optv >= 2)
 				hexdump(data,blocksz);
-			printf("* RCRD in block %ld 0x%lx (addr 0x%llx)\n",
-			     (long)blk,(long)blk,
-			     (long long)loclogblk(ctx, blk));
+			if (buf->rnum != blk)
+				printf("* RCRD for block %ld 0x%lx"
+				     " in block %ld (addr 0x%llx)\n",
+				     (long)blk,(long)blk,(long)buf->rnum,
+				     (long long)loclogblk(ctx, blk));
+			else
+				printf("* RCRD in block %ld 0x%lx (addr 0x%llx)\n",
+				     (long)blk,(long)blk,
+				     (long long)loclogblk(ctx, blk));
 		} else {
 			if (optt)
 				printf("block %ld\n",(long)blk);
@@ -3399,12 +3476,12 @@ static TRISTATE backward_rcrd(CONTEXT *ctx, u32 blk, int skipped,
 			k = buf->headsz;
 		else
 			k = firstrecord(skipped, buf, prevbuf);
-		logr = (const struct LOG_RECORD*)&data[k];
+		logr = (const LOG_RECORD*)&data[k];
 		cnt = 0;
 	   /* check whether there is at least one beginning of record */
 		endoff = le16_to_cpu(rph->next_record_offset);
 		if (k && ((k < endoff) || !endoff)) {
-			logr = (const struct LOG_RECORD*)&data[k];
+			logr = (const LOG_RECORD*)&data[k];
 			if (likelyop(logr)) {
 				stop = FALSE;
 				state = T_OK;
@@ -3430,7 +3507,7 @@ static TRISTATE backward_rcrd(CONTEXT *ctx, u32 blk, int skipped,
 				}
 			}
 			while (!stop) {
-				logr = (const struct LOG_RECORD*)&data[k];
+				logr = (const LOG_RECORD*)&data[k];
 				size = le32_to_cpu(logr->client_data_length)
 						+ LOG_RECORD_HEAD_SZ;
 				if ((size < MINRECSIZE)
@@ -3472,7 +3549,7 @@ static TRISTATE backward_rcrd(CONTEXT *ctx, u32 blk, int skipped,
 		}
 		for (j=cnt-1; (j>=0) && (state==T_OK); j--) {
 			k = poslist[j];
-			logr = (const struct LOG_RECORD*)&data[k];
+			logr = (const LOG_RECORD*)&data[k];
 			size = le32_to_cpu(logr->client_data_length)
 					+ LOG_RECORD_HEAD_SZ;
 			actionnum++;
@@ -3511,9 +3588,15 @@ static int walkback(CONTEXT *ctx, const struct BUFFER *buf, u32 blk,
 	u32 stopblk;
 	TRISTATE state;
 
-	if (optv)
-		printf("\n* block %d at 0x%llx\n",(int)blk,
+	if (optv) {
+		if ((log_major >= 2) && (buf->rnum != blk))
+			printf("\n* block %d for block %d at 0x%llx\n",
+					(int)buf->rnum,(int)blk,
+					(long long)loclogblk(ctx, buf->rnum));
+		else
+			printf("\n* block %d at 0x%llx\n",(int)blk,
 					(long long)loclogblk(ctx, blk));
+	}
 	ctx->firstaction = (struct ACTION_RECORD*)NULL;
 	ctx->lastaction = (struct ACTION_RECORD*)NULL;
 	nextbuf = (const struct BUFFER*)NULL;
@@ -3536,8 +3619,10 @@ static int walkback(CONTEXT *ctx, const struct BUFFER *buf, u32 blk,
 				skipped = blk - prevblk - 1;
 			else
 				skipped = blk - prevblk - 1
-					+ (logfilesz >> blockbits) - BASEBLKS;
-			magic = prevbuf->block.record.head.magic;
+					+ (logfilesz >> blockbits)
+					- (log_major < 2 ? BASEBLKS
+							: BASEBLKS2);
+			magic = prevbuf->block.record.magic;
 			switch (magic) {
 			case magic_RCRD :
 				break;
@@ -3559,9 +3644,18 @@ static int walkback(CONTEXT *ctx, const struct BUFFER *buf, u32 blk,
 						(long long)loclogblk(ctx, blk),
 						(long)prevblk);
 				else
-					printf("\n* block %ld at 0x%llx\n",
-						(long)blk,
-						(long long)loclogblk(ctx, blk));
+					if ((log_major >= 2)
+					    && (buf->rnum != blk))
+						printf("\n* block %ld for block %ld at 0x%llx\n",
+							(long)buf->rnum,
+							(long)blk,
+							(long long)loclogblk(
+							    ctx,buf->rnum));
+					else
+						printf("\n* block %ld at 0x%llx\n",
+							(long)blk,
+							(long long)loclogblk(
+								ctx, blk));
 			}
 			state = backward_rcrd(ctx, blk, skipped,
 						buf, prevbuf, nextbuf);
@@ -3592,6 +3686,155 @@ static int walkback(CONTEXT *ctx, const struct BUFFER *buf, u32 blk,
 	return (state == T_ERR ? 1 : 0);
 }
 
+/*
+ *		Find the latest log block
+ *
+ *	Usually, the latest block is either block 2 or 3 which act as
+ *	temporary block before being copied to target location.
+ *	However under some unknown condition the block are written
+ *	immediately to target location, and we have to scan for the
+ *	latest one.
+ *	Currently this is not checked for logfile version 2.x which
+ *	use a different layout of temporary blocks.
+ */
+
+static const struct BUFFER *find_latest_block(CONTEXT *ctx, u32 baseblk,
+			const struct BUFFER *basebuf)
+{
+	le64 offset;
+	leLSN prevlsn;
+	leLSN curlsn;
+	u32 curblk;
+	u32 prevblk;
+	const struct BUFFER *prevbuf;
+	const struct BUFFER *curbuf;
+
+	offset = basebuf->block.record.copy.file_offset;
+	curbuf = (const struct BUFFER*)NULL;
+	curlsn = const_cpu_to_le64(0);
+	prevblk = 0;
+	curblk = baseblk;
+	do {
+		if (curblk < BASEBLKS) {
+			prevbuf = basebuf;
+			prevlsn = basebuf->block.record.last_end_lsn;
+			prevblk = baseblk;
+			curblk = le64_to_cpu(offset) >> blockbits;
+		} else {
+			if (optv)
+				printf("block %d is more recent than block %d\n",
+					(int)curblk, (int)prevblk);
+			prevbuf = curbuf;
+			prevlsn = curlsn;
+			prevblk = curblk;
+			curblk++;
+			if (curblk >= (logfilesz >> blockbits))
+				curblk = (log_major < 2 ? BASEBLKS : BASEBLKS2);
+		}
+		curbuf = read_buffer(ctx, curblk);
+		if (curbuf && (curbuf->block.record.magic == magic_RCRD)) {
+			curlsn = curbuf->block.record.copy.last_lsn;
+		}
+	} while (curbuf
+		&& (curbuf->block.record.magic == magic_RCRD)
+		&& (le64_to_cpu(curlsn) > le64_to_cpu(prevlsn)));
+	if (optv)
+		printf("Block %d is the latest one\n",(int)prevblk);
+	return (prevbuf);
+}
+
+/*
+ *		Determine the sequencing of blocks (when version >= 2.0)
+ *
+ *	Blocks 2..17 and 18..33 are temporary blocks being filled until
+ *	they are copied to their target locations, so there are three
+ *	possible location for recent blocks.
+ *
+ *	Returns the latest target block number
+ */
+
+static int block_sequence(CONTEXT *ctx)
+{
+	const struct BUFFER *buf;
+	int blk;
+	int k;
+	int target_blk;
+	int latest_blk;
+	s64 final_lsn;
+	s64 last_lsn;
+	s64 last_lsn12;
+	s64 last_lsn1, last_lsn2;
+
+	final_lsn = 0;
+	for (blk=RSTBLKS; 2*blk<(RSTBLKS+BASEBLKS2); blk++) {
+			/* First temporary block */
+		last_lsn1 = 0;
+		buf = read_buffer(ctx, blk);
+		if (buf && (buf->block.record.magic == magic_RCRD)) {
+			last_lsn1 = le64_to_cpu(
+					buf->block.record.copy.last_lsn);
+			if (!final_lsn
+			    || ((s64)(last_lsn1 - final_lsn) > 0))
+				final_lsn = last_lsn1;
+		}
+			/* Second temporary block */
+		buf = read_buffer(ctx, blk + (BASEBLKS2 - RSTBLKS)/2);
+		last_lsn2 = 0;
+		if (buf && (buf->block.record.magic == magic_RCRD)) {
+			last_lsn2 = le64_to_cpu(
+					buf->block.record.copy.last_lsn);
+			if (!final_lsn
+			    || ((s64)(last_lsn2 - final_lsn) > 0))
+				final_lsn = last_lsn2;
+		}
+			/* the latest last_lsn defines the target block */
+		last_lsn12 = 0;
+		latest_blk = 0;
+		if (last_lsn1 || last_lsn2) {
+			if (!last_lsn2
+			    || ((s64)(last_lsn1 - last_lsn2) > 0)) {
+				last_lsn12 = last_lsn1;
+				latest_blk = blk;
+			}
+			if (!last_lsn1
+			    || ((s64)(last_lsn1 - last_lsn2) <= 0)) {
+				last_lsn12 = last_lsn2;
+				latest_blk = blk + (BASEBLKS2 - RSTBLKS)/2;
+			}
+		}
+		last_lsn = 0;
+		target_blk = 0;
+		if (last_lsn12) {
+			target_blk = (last_lsn12 & offset_mask)
+							>> (blockbits - 3);
+			buf = read_buffer(ctx, target_blk);
+			if (buf && (buf->block.record.magic == magic_RCRD)) {
+				last_lsn = le64_to_cpu(
+					buf->block.record.copy.last_lsn);
+				if (!final_lsn
+				    || ((s64)(last_lsn - final_lsn) > 0))
+					final_lsn = last_lsn;
+			}
+		}
+			/* redirect to the latest block */
+		if (latest_blk
+		    && (!last_lsn || ((s64)(last_lsn - last_lsn12) < 0)))
+			redirect[latest_blk] = target_blk;
+	}
+	if (optv) {
+		printf("\n Blocks redirected :\n");
+		for (k=RSTBLKS; k<BASEBLKS2; k++)
+			if (redirect[k])
+				printf("* block %d to block %d\n",
+					(int)redirect[k],(int)k);
+	}
+	latest_lsn = final_lsn;
+	blk = (final_lsn & offset_mask) >> (blockbits - 3);
+	if (optv > 1)
+		printf("final lsn %llx in blk %d\n",(long long)final_lsn,blk);
+	return (blk);
+}
+
 static int walk(CONTEXT *ctx)
 {
 	const struct BUFFER *buf;
@@ -3599,11 +3842,12 @@ static int walk(CONTEXT *ctx)
 	const struct BUFFER *prevbuf;
 	const struct BUFFER *startbuf;
 	const NTFS_RECORD *record;
-	const struct RECORD_PAGE_HEADER *rph;
+	const RECORD_PAGE_HEADER *rph;
 	NTFS_RECORD_TYPES magic;
 	u32 blk;
 	u32 nextblk;
 	u32 prevblk;
+	u32 finalblk;
 	int err;
 	u16 blkheadsz;
 	u16 pos;
@@ -3617,6 +3861,7 @@ static int walk(CONTEXT *ctx)
 	}
 	done = FALSE;
 	dirty = TRUE;
+	finalblk = 0;
 	err = 0;
 	blk = 0;
 	pos = 0;
@@ -3635,7 +3880,8 @@ static int walk(CONTEXT *ctx)
 	while (!done) {
 		 /* next block is needed to process the current one */
 		if ((nextblk >= (logfilesz >> blockbits)) && (optr || optf))
-			nextbuf = read_buffer(ctx, BASEBLKS);
+			nextbuf = read_buffer(ctx,
+					(log_major < 2 ? BASEBLKS : BASEBLKS2));
 		else
 			nextbuf = read_buffer(ctx,nextblk);
 		if (nextbuf) {
@@ -3652,7 +3898,7 @@ static int walk(CONTEXT *ctx)
 				err = 1;
 				break;
 			}
-			magic = buf->block.record.head.magic;
+			magic = buf->block.record.magic;
 			switch (magic) {
 			case magic_CHKD :
 			case magic_RSTR :
@@ -3701,17 +3947,30 @@ static int walk(CONTEXT *ctx)
 		}
 		blk = nextblk;
 		nextblk++;
+
+		if (!optr && (log_major >= 2) && (nextblk == RSTBLKS)) {
+			finalblk = block_sequence(ctx);
+			if (!finalblk) {
+				done = TRUE;
+				err = 1;
+			}
+		}
+
 		if (optr) { /* Only selected range */
-			if ((nextblk == BASEBLKS) && (nextblk < firstblk))
+			u32 endblk;
+
+			endblk = (log_major < 2 ? BASEBLKS : RSTBLKS);
+			if ((nextblk == endblk) && (nextblk < firstblk))
 				 nextblk = firstblk;
-			if ((blk >= BASEBLKS) && (blk > lastblk))
+			if ((blk >= endblk) && (blk > lastblk))
 				done = TRUE;
 		} else
 			if (optf) { /* Full log, forward */
 				if (blk*blocksz >= logfilesz)
 					done = TRUE;
 			} else
-				if (optb || optp || optu || opts) {
+				if (optb || optp || optu || opts
+				    || (log_major >= 2)) {
 					/* Restart blocks only (2 blocks) */
 					if (blk >= RSTBLKS)
 						done = TRUE;
@@ -3742,16 +4001,18 @@ static int walk(CONTEXT *ctx)
 	}
 	if (optv && opts && !dirty)
 		printf("* Volume is clean, nothing to do\n");
-	if (optb || optp || optu
-	    || (opts && dirty)) {
+	if (log_major >= 2)
+		blk = finalblk;
+	if (!err
+	    && (optb || optp || optu || (opts && dirty))) {
 		playedactions = 0;
 		ctx->firstaction = (struct ACTION_RECORD*)NULL;
 		ctx->lastaction = (struct ACTION_RECORD*)NULL;
-		buf = nextbuf;
-		nextbuf = read_buffer(ctx, blk+1);
-		startbuf = best_start(buf,nextbuf);
-		if (startbuf) {
-			if (startbuf == nextbuf) {
+		if (log_major < 2) {
+			buf = nextbuf;
+			nextbuf = read_buffer(ctx, blk+1);
+			startbuf = best_start(buf,nextbuf);
+			if (startbuf && (startbuf == nextbuf)) {
 				/* nextbuf is better, show blk */
 				if (optv && buf) {
 					printf("* Ignored block %d at 0x%llx\n",
@@ -3778,6 +4039,17 @@ static int walk(CONTEXT *ctx)
 							&nextbuf->block.record);
 				}
 			}
+			if (startbuf && opts) {
+				buf = startbuf = find_latest_block(ctx,
+						blk, startbuf);
+				latest_lsn = le64_to_cpu(
+					buf->block.record.last_end_lsn);
+			}
+		} else {
+			buf = startbuf = read_buffer(ctx, blk);
+			nextbuf = (const struct BUFFER*)NULL;
+		}
+		if (startbuf) {
 			/* The latest buf may be more recent than restart */
 			rph = &buf->block.record;
 			if ((s64)(sle64_to_cpu(rph->last_end_lsn)
@@ -3790,7 +4062,7 @@ static int walk(CONTEXT *ctx)
 			prevbuf = findprevious(ctx, buf);
 			if (prevbuf) {
 				prevblk = prevbuf->num;
-				magic = prevbuf->block.record.head.magic;
+				magic = prevbuf->block.record.magic;
 				switch (magic) {
 				case magic_RCRD :
 					break;
@@ -3834,7 +4106,7 @@ static void version(void)
 {
 	printf("\n%s v%s (libntfs-3g) - Recover updates committed by Windows"
 			" on an NTFS Volume.\n\n", "ntfsrecover", VERSION);
-	printf("Copyright (c) 2012-2015 Jean-Pierre Andre\n");
+	printf("Copyright (c) 2012-2017 Jean-Pierre Andre\n");
 	printf("\n%s\n%s%s\n", ntfs_gpl, ntfs_bugs, ntfs_home);
 }
 
@@ -3850,6 +4122,7 @@ static void usage(void)
 	fprintf(stderr,"	   -i : show invalid (stale) records\n");
 	fprintf(stderr,"	   -f : show the full log forward\n");
 	fprintf(stderr,"	   -h : show this help information\n");
+	fprintf(stderr,"	   -k : kill fast restart data\n");
 	fprintf(stderr,"	   -n : do not apply any modification\n");
 	fprintf(stderr,"	   -p : undo the latest count transaction sets and play one\n");
 	fprintf(stderr,"	   -r : show a range of log blocks forward\n");
@@ -3858,7 +4131,6 @@ static void usage(void)
 	fprintf(stderr,"	   -u : undo the latest count transaction sets\n");
 	fprintf(stderr,"	   -v : show more information (-vv yet more)\n");
 	fprintf(stderr,"	   -V : show version and exit\n");
-	fprintf(stderr,"     Copyright (c) 2012-2015 Jean-Pierre Andre\n");
 }
 
 /*
@@ -3872,12 +4144,13 @@ static BOOL getoptions(int argc, char *argv[])
 	u32 xval;
 	char *endptr;
 	BOOL err;
-	static const char *sopt = "-bc:hifnp:r:stu:vVx:";
+	static const char *sopt = "-bc:hifknp:r:stu:vVx:";
 	static const struct option lopt[] = {
 		{ "backward",		no_argument,		NULL, 'b' },
 		{ "clusters",		required_argument,	NULL, 'c' },
 		{ "forward",		no_argument,		NULL, 'f' },
 		{ "help",		no_argument,		NULL, 'h' },
+		{ "kill-fast-restart",	no_argument,		NULL, 'k' },
 		{ "no-action",		no_argument,		NULL, 'n' },
 		{ "play",		required_argument,	NULL, 'p' },
 		{ "range",		required_argument,	NULL, 'r' },
@@ -3897,6 +4170,7 @@ static BOOL getoptions(int argc, char *argv[])
 	optf = FALSE;
 	opth = FALSE;
 	opti = FALSE;
+	optk = FALSE;
 	optn = FALSE;
 	optp = FALSE;
 	optr = FALSE;
@@ -3938,6 +4212,9 @@ static BOOL getoptions(int argc, char *argv[])
 		case '?':
 		case 'h':
 			opth = TRUE;
+			break;
+		case 'k':
+			optk = TRUE;
 			break;
 		case 'n':
 			optn = TRUE;
@@ -4052,40 +4329,40 @@ static BOOL checkstructs(void)
 	BOOL ok;
 
 	ok = TRUE;
-   	if (sizeof(struct RECORD_PAGE_HEADER) != 40) {
+   	if (sizeof(RECORD_PAGE_HEADER) != 40) {
       		fprintf(stderr,
-			"* error : bad sizeof(struct RECORD_PAGE_HEADER) %d\n",
-			(int)sizeof(struct RECORD_PAGE_HEADER));
+			"* error : bad sizeof(RECORD_PAGE_HEADER) %d\n",
+			(int)sizeof(RECORD_PAGE_HEADER));
 		ok = FALSE;
 	}
-	if (sizeof(struct LOG_RECORD) != 88) {
+	if (sizeof(LOG_RECORD) != 88) {
       		fprintf(stderr,
-			"* error : bad sizeof(struct LOG_RECORD) %d\n",
-			(int)sizeof(struct LOG_RECORD));
+			"* error : bad sizeof(LOG_RECORD) %d\n",
+			(int)sizeof(LOG_RECORD));
 		ok = FALSE;
 	}
-   	if (sizeof(struct RESTART_PAGE_HEADER) != 32) {
+   	if (sizeof(RESTART_PAGE_HEADER) != 32) {
       		fprintf(stderr,
-			"* error : bad sizeof(struct RESTART_PAGE_HEADER) %d\n",
-			(int)sizeof(struct RESTART_PAGE_HEADER));
+			"* error : bad sizeof(RESTART_PAGE_HEADER) %d\n",
+			(int)sizeof(RESTART_PAGE_HEADER));
 		ok = FALSE;
 	}
-   	if (sizeof(struct RESTART_AREA) != 44) {
+   	if (sizeof(RESTART_AREA) != 48) {
       		fprintf(stderr,
-			"* error : bad sizeof(struct RESTART_AREA) %d\n",
-			(int)sizeof(struct RESTART_AREA));
+			"* error : bad sizeof(RESTART_AREA) %d\n",
+			(int)sizeof(RESTART_AREA));
 		ok = FALSE;
 	}
-   	if (sizeof(struct ATTR_OLD) != 44) {
+   	if (sizeof(ATTR_OLD) != 44) {
       		fprintf(stderr,
-			"* error : bad sizeof(struct ATTR_OLD) %d\n",
-			(int)sizeof(struct ATTR_OLD));
+			"* error : bad sizeof(ATTR_OLD) %d\n",
+			(int)sizeof(ATTR_OLD));
 		ok = FALSE;
 	}
-   	if (sizeof(struct ATTR_NEW) != 40) {
+   	if (sizeof(ATTR_NEW) != 40) {
       		fprintf(stderr,
-			"* error : bad sizeof(struct ATTR_NEW) %d\n",
-			(int)sizeof(struct ATTR_NEW));
+			"* error : bad sizeof(ATTR_NEW) %d\n",
+			(int)sizeof(ATTR_NEW));
 		ok = FALSE;
 	}
 	if (LastAction != 38) {
