@@ -4,6 +4,9 @@
 /* Define if building universal (internal helper macro) */
 /* #undef AC_APPLE_UNIVERSAL_BUILD */
 
+/* Define to 1 for disabling reparse plugins */
+/* #undef DISABLE_PLUGINS */
+
 /* Define this to 1 if you want to enable support of encrypted files in
    libntfs and utilities. */
 /* #undef ENABLE_CRYPTO */
@@ -23,7 +26,7 @@
 /* #undef ENABLE_UUID */
 
 /* Define to 1 if using internal fuse */
-/* #undef FUSE_INTERNAL */
+#define FUSE_INTERNAL 1
 
 /* Define to 1 if you have the `atexit' function. */
 #define HAVE_ATEXIT 1
@@ -86,16 +89,19 @@
 #define HAVE_GETTIMEOFDAY 1
 
 /* Define to 1 if you have the `hasmntopt' function. */
-#undef HAVE_HASMNTOPT
+#define HAVE_HASMNTOPT 1
 
 /* Define to 1 if you have the <inttypes.h> header file. */
 #define HAVE_INTTYPES_H 1
+
+/* Define to 1 if you have the `c' library (-lc). */
+#define HAVE_LIBC 1
 
 /* Define to 1 if you have the <libgen.h> header file. */
 #define HAVE_LIBGEN_H 1
 
 /* Define to 1 if you have the <libintl.h> header file. */
-#undef HAVE_LIBINTL_H
+/* #undef HAVE_LIBINTL_H */
 
 /* Define to 1 if you have the <limits.h> header file. */
 #define HAVE_LIMITS_H 1
@@ -225,7 +231,7 @@
 #define HAVE_STRUCT_STAT_ST_ATIM 1
 
 /* Define to 1 if `st_atimensec' is a member of `struct stat'. */
-/* #undef HAVE_STRUCT_STAT_ST_ATIMENSEC */
+#define HAVE_STRUCT_STAT_ST_ATIMENSEC 1
 
 /* Define to 1 if `st_atimespec' is a member of `struct stat'. */
 /* #undef HAVE_STRUCT_STAT_ST_ATIMESPEC */
@@ -253,13 +259,10 @@
 /* #undef HAVE_SYS_DISK_H */
 
 /* Define to 1 if you have the <sys/endian.h> header file. */
-/* #undef HAVE_SYS_ENDIAN_H */
+#define HAVE_SYS_ENDIAN_H 1
 
 /* Define to 1 if you have the <sys/ioctl.h> header file. */
 #define HAVE_SYS_IOCTL_H 1
-
-/* Define to 1 if you have the <sys/mkdev.h> header file. */
-/* #undef HAVE_SYS_MKDEV_H */
 
 /* Define to 1 if you have the <sys/mount.h> header file. */
 #define HAVE_SYS_MOUNT_H 1
@@ -272,9 +275,6 @@
 
 /* Define to 1 if you have the <sys/stat.h> header file. */
 #define HAVE_SYS_STAT_H 1
-
-/* Define to 1 if you have the <sys/sysmacros.h> header file. */
-#define HAVE_SYS_SYSMACROS_H 1
 
 /* Define to 1 if you have the <sys/types.h> header file. */
 #define HAVE_SYS_TYPES_H 1
@@ -319,9 +319,16 @@
    slash. */
 #define LSTAT_FOLLOWS_SLASHED_SYMLINK 1
 
-/* Define to the sub-directory in which libtool stores uninstalled libraries.
-   */
+/* Define to the sub-directory where libtool stores uninstalled libraries. */
 #define LT_OBJDIR ".libs/"
+
+/* Define to 1 if `major', `minor', and `makedev' are declared in <mkdev.h>.
+   */
+/* #undef MAJOR_IN_MKDEV */
+
+/* Define to 1 if `major', `minor', and `makedev' are declared in
+   <sysmacros.h>. */
+#define MAJOR_IN_SYSMACROS 1
 
 /* Don't use default IO ops */
 /* #undef NO_NTFS_DEVICE_DEFAULT_IO_OPS */
@@ -336,7 +343,7 @@
 #define PACKAGE_NAME "ntfs-3g"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "ntfs-3g 2015.3.14"
+#define PACKAGE_STRING "ntfs-3g 2017.3.23"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "ntfs-3g"
@@ -345,7 +352,7 @@
 #define PACKAGE_URL ""
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "2015.3.14"
+#define PACKAGE_VERSION "2017.3.23"
 
 /* POSIX ACL support */
 /* #undef POSIXACLS */
@@ -376,7 +383,7 @@
 
 
 /* Version number of package */
-#define VERSION "2015.3.14"
+#define VERSION "2017.3.23"
 
 /* Define to 1 if this is a Windows OS */
 /* #undef WINDOWS */
@@ -406,7 +413,7 @@
 #endif
 
 /* Number of bits in a file offset, on hosts where this is settable. */
-/* #undef _FILE_OFFSET_BITS */
+#define _FILE_OFFSET_BITS 64
 
 /* Define for large files, on AIX-style hosts. */
 /* #undef _LARGE_FILES */
@@ -422,7 +429,7 @@
 /* #undef _POSIX_SOURCE */
 
 /* Required define if using POSIX threads */
-/* #undef _REENTRANT */
+#define _REENTRANT 1
 
 /* Define to empty if `const' does not conform to ANSI C. */
 /* #undef const */

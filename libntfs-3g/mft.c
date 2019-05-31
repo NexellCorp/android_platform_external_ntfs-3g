@@ -5,7 +5,7 @@
  * Copyright (c) 2004-2005 Richard Russon
  * Copyright (c) 2004-2008 Szabolcs Szakacsits
  * Copyright (c)      2005 Yura Pakhuchiy
- * Copyright (c) 2014-2015 Jean-Pierre Andre
+ * Copyright (c) 2014-2018 Jean-Pierre Andre
  *
  * This program/include file is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License as published
@@ -1389,16 +1389,27 @@ ntfs_inode *ntfs_mft_rec_alloc(ntfs_volume *vol, BOOL mft_data)
 			 */
 		if (ext_ni) {
 			/*
-			 * Make sure record 15 is a base extent and has
-			 * no extents.
-			 * Also make sure it has no name : a base inode with
-			 * no extents and no name cannot be in use.
-			 * Otherwise apply standard procedure.
+			 * Make sure record 15 is a base extent and it has
+			 * no name. A base inode with no name cannot be in use.
+			 * The test based on base_mft_record fails for
+			 * extents of MFT, so we need a special check.
+			 * If already used, apply standard procedure.
 			 */
    			if (!ext_ni->mrec->base_mft_record
-			    && !ext_ni->nr_extents)
+			    && !ext_ni->mrec->link_count)
 				forced_mft_data = TRUE;
 			ntfs_inode_close(ext_ni);
+			/* Double-check, in case it is used for MFT */
+			if (forced_mft_data && base_ni->nr_extents) {
+				int i;
+
+				for (i=0; i<base_ni->nr_extents; i++) {
+					if (base_ni->extent_nis[i]
+					    && (base_ni->extent_nis[i]->mft_no
+							== FILE_mft_data))
+						forced_mft_data = FALSE;
+   				}
+			}
 		}
 	}
 	if (forced_mft_data)
@@ -1629,6 +1640,7 @@ ntfs_inode *ntfs_mft_record_alloc(ntfs_volume *vol, ntfs_inode *base_ni)
 	int err;
 	u32 usa_ofs;
 	le16 seq_no, usn;
+	BOOL oldwarn;
 
 	if (base_ni)
 		ntfs_log_enter("Entering (allocating an extent mft record for "
@@ -1742,10 +1754,22 @@ found_free_rec:
 	if (!m)
 		goto undo_mftbmp_alloc;
 	
+	/*
+	 * As this is allocating a new record, do not expect it to have
+	 * been initialized previously, so do not warn over bad fixups
+	 * (hence avoid warn flooding when an NTFS partition has been wiped).
+	 */
+	oldwarn = !NVolNoFixupWarn(vol);
+	NVolSetNoFixupWarn(vol);
 	if (ntfs_mft_record_read(vol, bit, m)) {
+		if (oldwarn)
+			NVolClearNoFixupWarn(vol);
 		free(m);
 		goto undo_mftbmp_alloc;
 	}
+	if (oldwarn)
+		NVolClearNoFixupWarn(vol);
+
 	/* Sanity check that the mft record is really not in use. */
 	if (ntfs_is_file_record(m->magic) && (m->flags & MFT_RECORD_IN_USE)) {
 		ntfs_log_error("Inode %lld is used but it wasn't marked in "
