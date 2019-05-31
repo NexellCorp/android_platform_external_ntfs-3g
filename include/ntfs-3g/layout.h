@@ -161,6 +161,12 @@ typedef enum {
 #define ntfs_is_empty_recordp(p)	( ntfs_is_magicp(p, empty) )
 
 
+/*
+ * The size of a logical sector in bytes, used as the sequence number stride for
+ * multi-sector transfers.  This is intended to be less than or equal to the
+ * physical sector size, since if this were greater than the physical sector
+ * size, then incomplete multi-sector transfers may not be detected.
+ */
 #define NTFS_BLOCK_SIZE		512
 #define NTFS_BLOCK_SIZE_BITS	9
 
@@ -515,16 +521,15 @@ typedef enum {
  * enum COLLATION_RULES - The collation rules for sorting views/indexes/etc
  * (32-bit).
  *
- * COLLATION_UNICODE_STRING - Collate Unicode strings by comparing their binary
- *	Unicode values, except that when a character can be uppercased, the
- *	upper case value collates before the lower case one.
- * COLLATION_FILE_NAME - Collate file names as Unicode strings. The collation
- *	is done very much like COLLATION_UNICODE_STRING. In fact I have no idea
- *	what the difference is. Perhaps the difference is that file names
- *	would treat some special characters in an odd way (see
- *	unistr.c::ntfs_collate_names() and unistr.c::legal_ansi_char_array[]
- *	for what I mean but COLLATION_UNICODE_STRING would not give any special
- *	treatment to any characters at all, but this is speculation.
+ * COLLATION_BINARY - Collate by binary compare where the first byte is most
+ *	significant.
+ * COLLATION_FILE_NAME - Collate Unicode strings by comparing their 16-bit
+ *	coding units, primarily ignoring case using the volume's $UpCase table,
+ *	but falling back to a case-sensitive comparison if the names are equal
+ *	ignoring case.
+ * COLLATION_UNICODE_STRING - TODO: this is not yet implemented and still needs
+ *	to be properly documented --- is it really the same as
+ *	COLLATION_FILE_NAME?
  * COLLATION_NTOFS_ULONG - Sorting is done according to ascending le32 key
  *	values. E.g. used for $SII index in FILE_Secure, which sorts by
  *	security_id (le32).
@@ -549,17 +554,9 @@ typedef enum {
  *	equal then the second le32 values would be compared, etc.
  */
 typedef enum {
-	COLLATION_BINARY	 = const_cpu_to_le32(0), /* Collate by binary
-					compare where the first byte is most
-					significant. */
-	COLLATION_FILE_NAME	 = const_cpu_to_le32(1), /* Collate file names
-					as Unicode strings. */
-	COLLATION_UNICODE_STRING = const_cpu_to_le32(2), /* Collate Unicode
-					strings by comparing their binary
-					Unicode values, except that when a
-					character can be uppercased, the upper
-					case value collates before the lower
-					case one. */
+	COLLATION_BINARY		= const_cpu_to_le32(0),
+	COLLATION_FILE_NAME		= const_cpu_to_le32(1),
+	COLLATION_UNICODE_STRING	= const_cpu_to_le32(2),
 	COLLATION_NTOFS_ULONG		= const_cpu_to_le32(16),
 	COLLATION_NTOFS_SID		= const_cpu_to_le32(17),
 	COLLATION_NTOFS_SECURITY_HASH	= const_cpu_to_le32(18),
@@ -1071,12 +1068,17 @@ typedef enum {
 	FILE_NAME_WIN32			= 0x01,
 		/* The standard WinNT/2k NTFS long filenames. Case insensitive.
 		   All Unicode chars except: '\0', '"', '*', '/', ':', '<',
-		   '>', '?', '\' and '|'. Further, names cannot end with a '.'
-		   or a space. */
+		   '>', '?', '\' and '|'.  Trailing dots and spaces are allowed,
+		   even though on Windows a filename with such a suffix can only
+		   be created and accessed using a WinNT-style path, i.e.
+		   \\?\-prefixed.  (If a regular path is used, Windows will
+		   strip the trailing dots and spaces, which makes such
+		   filenames incompatible with most Windows software.) */
 	FILE_NAME_DOS			= 0x02,
 		/* The standard DOS filenames (8.3 format). Uppercase only.
 		   All 8-bit characters greater space, except: '"', '*', '+',
-		   ',', '/', ':', ';', '<', '=', '>', '?' and '\'. */
+		   ',', '/', ':', ';', '<', '=', '>', '?' and '\'.  Trailing
+		   dots and spaces are forbidden. */
 	FILE_NAME_WIN32_AND_DOS		= 0x03,
 		/* 3 means that both the Win32 and the DOS filenames are
 		   identical and hence have been saved in this single filename
@@ -1431,6 +1433,26 @@ typedef enum {
 
 	/* This one is for WinNT&2k. */
 	ACCESS_MAX_MS_ACE_TYPE		= 8,
+
+	/* Windows XP and later */
+	ACCESS_ALLOWED_CALLBACK_ACE_TYPE	= 9,
+	ACCESS_DENIED_CALLBACK_ACE_TYPE		= 10,
+	ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE	= 11,
+	ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE	= 12,
+	SYSTEM_AUDIT_CALLBACK_ACE_TYPE		= 13,
+	SYSTEM_ALARM_CALLBACK_ACE_TYPE		= 14, /* reserved */
+	SYSTEM_AUDIT_CALLBACK_OBJECT_ACE_TYPE   = 15,
+	SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE   = 16, /* reserved */
+
+	/* Windows Vista and later */
+	SYSTEM_MANDATORY_LABEL_ACE_TYPE		= 17,
+
+	/* Windows 8 and later */
+	SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE	= 18,
+	SYSTEM_SCOPED_POLICY_ID_ACE_TYPE	= 19,
+
+	/* Windows 10 and later */
+	SYSTEM_PROCESS_TRUST_LABEL_ACE_TYPE	= 20,
 } __attribute__((__packed__)) ACE_TYPES;
 
 /**
@@ -2381,17 +2403,23 @@ typedef struct {
  *
  * 1. The least significant 16 bits (i.e. bits 0 to 15) specify the type of
  *    the reparse point.
- * 2. The 13 bits after this (i.e. bits 16 to 28) are reserved for future use.
- * 3. The most significant three bits are flags describing the reparse point.
+ * 2. The 12 bits after this (i.e. bits 16 to 27) are reserved for future use.
+ * 3. The most significant four bits are flags describing the reparse point.
  *    They are defined as follows:
+ *	bit 28: Directory bit. If set, the directory is not a surrogate
+ *		and can be used the usual way.
  *	bit 29: Name surrogate bit. If set, the filename is an alias for
  *		another object in the system.
  *	bit 30: High-latency bit. If set, accessing the first byte of data will
  *		be slow. (E.g. the data is stored on a tape drive.)
  *	bit 31: Microsoft bit. If set, the tag is owned by Microsoft. User
  *		defined tags have to use zero here.
+ * 4. Moreover, on Windows 10 :
+ *	Some flags may be used in bits 12 to 15 to further describe the
+ *	reparse point.
  */
 typedef enum {
+	IO_REPARSE_TAG_DIRECTORY	= const_cpu_to_le32(0x10000000),
 	IO_REPARSE_TAG_IS_ALIAS		= const_cpu_to_le32(0x20000000),
 	IO_REPARSE_TAG_IS_HIGH_LATENCY	= const_cpu_to_le32(0x40000000),
 	IO_REPARSE_TAG_IS_MICROSOFT	= const_cpu_to_le32(0x80000000),
@@ -2411,9 +2439,15 @@ typedef enum {
 	IO_REPARSE_TAG_SIS		= const_cpu_to_le32(0x80000007),
 	IO_REPARSE_TAG_SYMLINK		= const_cpu_to_le32(0xA000000C),
 	IO_REPARSE_TAG_WIM		= const_cpu_to_le32(0x80000008),
+	IO_REPARSE_TAG_DFM		= const_cpu_to_le32(0x80000016),
 	IO_REPARSE_TAG_WOF		= const_cpu_to_le32(0x80000017),
+	IO_REPARSE_TAG_WCI		= const_cpu_to_le32(0x80000018),
+	IO_REPARSE_TAG_CLOUD		= const_cpu_to_le32(0x9000001A),
+	IO_REPARSE_TAG_GVFS             = const_cpu_to_le32(0x9000001C),
+	IO_REPARSE_TAG_LX_SYMLINK       = const_cpu_to_le32(0xA000001D),
 
 	IO_REPARSE_TAG_VALID_VALUES	= const_cpu_to_le32(0xf000ffff),
+	IO_REPARSE_PLUGIN_SELECT	= const_cpu_to_le32(0xffff0fff),
 } PREDEFINED_REPARSE_TAGS;
 
 /**

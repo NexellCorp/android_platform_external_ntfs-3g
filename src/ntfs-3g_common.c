@@ -1,7 +1,7 @@
 /**
  * ntfs-3g_common.c - Common definitions for ntfs-3g and lowntfs-3g.
  *
- * Copyright (c) 2010-2015 Jean-Pierre Andre
+ * Copyright (c) 2010-2018 Jean-Pierre Andre
  * Copyright (c) 2010      Erik Larsson
  *
  * This program/include file is free software; you can redistribute it and/or
@@ -28,8 +28,16 @@
 #include <stdlib.h>
 #endif
 
+#ifdef HAVE_DLFCN_H
+#include <dlfcn.h>
+#endif
+
 #ifdef HAVE_STRING_H
 #include <string.h>
+#endif
+
+#ifdef HAVE_FCNTL_H
+#include <fcntl.h>
 #endif
 
 #ifdef HAVE_LIMITS_H
@@ -43,9 +51,13 @@
 #include <getopt.h>
 #include <fuse.h>
 
+#include "compat.h"
 #include "inode.h"
+#include "dir.h"
 #include "security.h"
 #include "xattrs.h"
+#include "reparse.h"
+#include "plugin.h"
 #include "ntfs-3g_common.h"
 #include "realpath.h"
 #include "misc.h"
@@ -77,6 +89,7 @@ const struct DEFOPTION optionlist[] = {
 	{ "atime", OPT_ATIME, FLGOPT_BOGUS },
 	{ "relatime", OPT_RELATIME, FLGOPT_BOGUS },
 	{ "delay_mtime", OPT_DMTIME, FLGOPT_DECIMAL | FLGOPT_OPTIONAL },
+	{ "rw", OPT_RW, FLGOPT_BOGUS },
 	{ "fake_rw", OPT_FAKE_RW, FLGOPT_BOGUS },
 	{ "fsname", OPT_FSNAME, FLGOPT_NOSUPPORT },
 	{ "no_def_opts", OPT_NO_DEF_OPTS, FLGOPT_BOGUS },
@@ -282,6 +295,9 @@ char *parse_mount_options(ntfs_fuse_context_t *ctx,
 			case OPT_RO :
 			case OPT_FAKE_RW :
 				ctx->ro = TRUE;
+				break;
+			case OPT_RW :
+				ctx->rw = TRUE;
 				break;
 			case OPT_NOATIME :
 				ctx->atime = ATIME_DISABLED;
@@ -534,6 +550,7 @@ char *parse_mount_options(ntfs_fuse_context_t *ctx,
 	if (ctx->ro) {
 		ctx->secure_flags &= ~(1 << SECURITY_ADDSECURIDS);
 		ctx->hiberfile = FALSE;
+		ctx->rw = FALSE;
 	}
 exit:
 	free(options);
@@ -747,6 +764,296 @@ int ntfs_fuse_listxattr_common(ntfs_inode *ni, ntfs_attr_search_ctx *actx,
 	}
 exit :
 	return (ret);
+}
+
+#endif /* HAVE_SETXATTR */
+
+#ifndef DISABLE_PLUGINS
+
+/*
+ *		Get attribute information for reparse directories
+ *
+ *	Reparse directories have a reparse tag which should be ignored.
+ */
+
+static int directory_getattr(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			      struct stat *stbuf)
+{
+	static ntfschar I30[] =
+		{ const_cpu_to_le16('$'), const_cpu_to_le16('I'),
+		  const_cpu_to_le16('3'), const_cpu_to_le16('0') };
+	ntfs_attr *na;
+	int res;
+
+	res = -EOPNOTSUPP;
+	if (ni && reparse && stbuf
+		&& ((reparse->reparse_tag == IO_REPARSE_TAG_WCI)
+		|| ((reparse->reparse_tag & IO_REPARSE_TAG_DIRECTORY)
+		    && !(reparse->reparse_tag & IO_REPARSE_TAG_IS_ALIAS)))
+	    && (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY)) {
+			/* Directory */
+		stbuf->st_mode = S_IFDIR | 0555;
+		/* get index size, if not known */
+		if (!test_nino_flag(ni, KnownSize)) {
+			na = ntfs_attr_open(ni, AT_INDEX_ALLOCATION, I30, 4);
+			if (na) {
+				ni->data_size = na->data_size;
+				ni->allocated_size = na->allocated_size;
+				set_nino_flag(ni, KnownSize);
+				ntfs_attr_close(na);
+			}
+		}
+		stbuf->st_size = ni->data_size;
+		stbuf->st_blocks = ni->allocated_size >> 9;
+		stbuf->st_nlink = 1;	/* Make find(1) work */
+		res = 0;
+	}
+	/* Not a directory, or another error occurred */
+	return (res);
+}
+
+/*
+ *		Open a reparse directory for reading
+ *
+ *	Currently no reading context is created.
+ */
+
+static int directory_opendir(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			   struct fuse_file_info *fi)
+{
+	int res;
+
+	res = -EOPNOTSUPP;
+	if (ni && reparse && fi
+	    && ((reparse->reparse_tag == IO_REPARSE_TAG_WCI)
+		|| ((reparse->reparse_tag & IO_REPARSE_TAG_DIRECTORY)
+		    && !(reparse->reparse_tag & IO_REPARSE_TAG_IS_ALIAS)))
+	    && (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY)
+	    && ((fi->flags & O_ACCMODE) == O_RDONLY))
+		res = 0;
+	return (res);
+}
+
+/*
+ *		Release a reparse directory
+ *
+ *	Should never be called, as no reading context was defined.
+ */
+
+static int directory_release(ntfs_inode *ni __attribute__((unused)),
+			   const REPARSE_POINT *reparse __attribute__((unused)),
+			   struct fuse_file_info *fi __attribute__((unused)))
+{
+	return 0;
+}
+
+/*
+ *		Read an open reparse directory
+ *
+ *	Returns 0 or a negative error code
+ */
+
+static int directory_readdir(ntfs_inode *ni, const REPARSE_POINT *reparse,
+			s64 *pos, void *fillctx, ntfs_filldir_t filldir,
+			struct fuse_file_info *fi __attribute__((unused)))
+{
+	int res;
+
+	res = -EOPNOTSUPP;
+	if (ni && reparse && pos && fillctx && filldir
+	    && ((reparse->reparse_tag == IO_REPARSE_TAG_WCI)
+	        || ((reparse->reparse_tag & IO_REPARSE_TAG_DIRECTORY)
+	    	    && !(reparse->reparse_tag & IO_REPARSE_TAG_IS_ALIAS)))
+	    && (ni->mrec->flags & MFT_RECORD_IS_DIRECTORY)) {
+		res = 0;
+		if (ntfs_readdir(ni, pos, fillctx, filldir))
+			res = -errno;
+	}
+	return (res);
+}
+
+int register_reparse_plugin(ntfs_fuse_context_t *ctx, le32 tag,
+				const plugin_operations_t *ops, void *handle)
+{
+	plugin_list_t *plugin;
+	int res;
+
+	res = -1;
+	if (ctx) {
+		plugin = (plugin_list_t*)ntfs_malloc(sizeof(plugin_list_t));
+		if (plugin) {
+			plugin->tag = tag;
+			plugin->ops = ops;
+			plugin->handle = handle;
+			plugin->next = ctx->plugins;
+			ctx->plugins = plugin;
+			res = 0;
+		}
+	}
+	return (res);
+}
+
+/*
+ *		Get the reparse operations associated to an inode
+ *
+ *	The plugin able to process the reparse point is dynamically loaded
+ *
+ *	When successful, returns the operations vector and the reparse
+ *		data if requested,
+ *	Otherwise returns NULL, with errno set.
+ */
+
+const struct plugin_operations *select_reparse_plugin(ntfs_fuse_context_t *ctx,
+				ntfs_inode *ni, REPARSE_POINT **reparse_wanted)
+{
+	const struct plugin_operations *ops;
+	void *handle;
+	REPARSE_POINT *reparse;
+	le32 tag, seltag;
+	plugin_list_t *plugin;
+	plugin_init_t pinit;
+
+	ops = (struct plugin_operations*)NULL;
+	reparse = ntfs_get_reparse_point(ni);
+	if (reparse) {
+		tag = reparse->reparse_tag;
+		seltag = tag;
+		if (tag & IO_REPARSE_TAG_DIRECTORY)
+			seltag &= IO_REPARSE_TAG_DIRECTORY;
+		for (plugin=ctx->plugins; plugin && (plugin->tag != seltag);
+						plugin = plugin->next) { }
+		if (plugin) {
+			ops = plugin->ops;
+		} else {
+#ifdef PLUGIN_DIR
+			char name[sizeof(PLUGIN_DIR) + 64];
+
+			snprintf(name,sizeof(name), PLUGIN_DIR
+					"/ntfs-plugin-%08lx.so",
+					(long)le32_to_cpu(seltag));
+#else
+			char name[64];
+
+			snprintf(name,sizeof(name), "ntfs-plugin-%08lx.so",
+					(long)le32_to_cpu(seltag));
+#endif
+			handle = dlopen(name, RTLD_LAZY);
+			if (handle) {
+				pinit = (plugin_init_t)dlsym(handle, "init");
+				if (pinit) {
+				/* pinit() should set errno if it fails */
+					ops = (*pinit)(tag);
+					if (ops && register_reparse_plugin(ctx,
+							seltag, ops, handle))
+						ops = (struct plugin_operations*)NULL;
+				} else
+					errno = ELIBBAD;
+				if (!ops)
+					dlclose(handle);
+			} else {
+				if (!(ctx->errors_logged & ERR_PLUGIN)) {
+					ntfs_log_perror(
+						"Could not load plugin %s",
+						name);
+					ntfs_log_error("Hint %s\n",dlerror());
+				}
+				ctx->errors_logged |= ERR_PLUGIN;
+			}
+		}
+		if (ops && reparse_wanted)
+			*reparse_wanted = reparse;
+		else
+			free(reparse);
+	}
+	return (ops);
+}
+
+void close_reparse_plugins(ntfs_fuse_context_t *ctx)
+{
+	while (ctx->plugins) {
+		plugin_list_t *next;
+
+		next = ctx->plugins->next;
+		if (ctx->plugins->handle)
+			dlclose(ctx->plugins->handle);
+		free(ctx->plugins);
+		ctx->plugins = next;
+	}
+}
+
+void register_directory_plugins(ntfs_fuse_context_t *ctx)
+{
+	static const struct plugin_operations ops = {
+		.getattr = directory_getattr,
+		.release = directory_release,
+		.opendir = directory_opendir,
+		.readdir = directory_readdir,
+	} ;
+
+	if (ctx) {
+		register_reparse_plugin(ctx, IO_REPARSE_TAG_WCI,
+						&ops, (void*)NULL);
+		register_reparse_plugin(ctx, IO_REPARSE_TAG_DIRECTORY,
+						&ops, (void*)NULL);
+	}
+}
+
+#endif /* DISABLE_PLUGINS */
+
+#ifdef HAVE_SETXATTR
+
+/*
+ *		Check whether a user xattr is allowed
+ *
+ *	The inode must be a plain file or a directory. The only allowed
+ *	metadata file is the root directory (useful for MacOSX and hopefully
+ *	does not harm Windows).
+ */
+
+BOOL user_xattrs_allowed(ntfs_fuse_context_t *ctx __attribute__((unused)),
+			ntfs_inode *ni)
+{
+	u32 dt_type;
+	BOOL res;
+
+		/* Quick return for common cases and root */
+	if (!(ni->flags & (FILE_ATTR_SYSTEM | FILE_ATTR_REPARSE_POINT))
+	    || (ni->mft_no == FILE_root))
+		res = TRUE;
+	else {
+			/* Reparse point depends on kind, see plugin */
+		if (ni->flags & FILE_ATTR_REPARSE_POINT) {
+#ifndef DISABLE_PLUGINS
+			struct stat stbuf;
+			REPARSE_POINT *reparse;
+			const plugin_operations_t *ops;
+
+			res = FALSE; /* default for error cases */
+			ops = select_reparse_plugin(ctx, ni, &reparse);
+			if (ops) {
+				if (ops->getattr
+				    && !ops->getattr(ni,reparse,&stbuf)) {
+					res = S_ISREG(stbuf.st_mode)
+						    || S_ISDIR(stbuf.st_mode);
+				}
+				free(reparse);
+			}
+#else /* DISABLE_PLUGINS */
+			res = FALSE; /* mountpoints, symlinks, ... */
+#endif /* DISABLE_PLUGINS */
+		} else {
+				/* Metadata */
+			if (ni->mft_no < FILE_first_user)
+				res = FALSE;
+			else {
+				/* Interix types */
+				dt_type = ntfs_interix_types(ni);
+				res = (dt_type == NTFS_DT_REG)
+					|| (dt_type == NTFS_DT_DIR);
+			}
+		}
+	}
+	return (res);
 }
 
 #endif /* HAVE_SETXATTR */

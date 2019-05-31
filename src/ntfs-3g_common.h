@@ -51,6 +51,7 @@ enum {
 	OPT_ATIME,
 	OPT_RELATIME,
 	OPT_DMTIME,
+	OPT_RW,
 	OPT_FAKE_RW,
 	OPT_FSNAME,
 	OPT_NO_DEF_OPTS,
@@ -110,6 +111,21 @@ typedef enum {
 	ATIME_RELATIVE
 } ntfs_atime_t;
 
+typedef enum {
+	ERR_PLUGIN = 1
+} single_log_t;
+
+#ifndef DISABLE_PLUGINS
+
+typedef struct plugin_list {
+	struct plugin_list *next;
+	void *handle;
+	const plugin_operations_t *ops;
+	le32 tag;
+} plugin_list_t;
+
+#endif /* DISABLE_PLUGINS */
+
 typedef struct {
 	ntfs_volume *vol;
 	unsigned int uid;
@@ -120,6 +136,7 @@ typedef struct {
 	ntfs_atime_t atime;
 	s64 dmtime;
 	BOOL ro;
+	BOOL rw;
 	BOOL show_sys_files;
 	BOOL hide_hid_files;
 	BOOL hide_dot_files;
@@ -145,8 +162,12 @@ typedef struct {
 	struct fuse_chan *fc;
 	BOOL inherit;
 	unsigned int secure_flags;
+	single_log_t errors_logged;
 	char *usermap_path;
 	char *abs_mnt_point;
+#ifndef DISABLE_PLUGINS
+	plugin_list_t *plugins;
+#endif /* DISABLE_PLUGINS */
 	struct PERMISSIONS_CACHE *seccache;
 	struct SECURITY_CONTEXT security;
 	struct open_file *open_files; /* only defined in lowntfs-3g */
@@ -181,5 +202,16 @@ int ntfs_parse_options(struct ntfs_options *popts, void (*usage)(void),
 
 int ntfs_fuse_listxattr_common(ntfs_inode *ni, ntfs_attr_search_ctx *actx,
  			char *list, size_t size, BOOL prefixing);
+BOOL user_xattrs_allowed(ntfs_fuse_context_t *ctx, ntfs_inode *ni);
+
+#ifndef DISABLE_PLUGINS
+
+void close_reparse_plugins(ntfs_fuse_context_t *ctx);
+const struct plugin_operations *select_reparse_plugin(ntfs_fuse_context_t *ctx,
+				ntfs_inode *ni, REPARSE_POINT **reparse);
+int register_reparse_plugin(ntfs_fuse_context_t *ctx, le32 tag,
+                                const plugin_operations_t *ops, void *handle);
+void register_directory_plugins(ntfs_fuse_context_t *ctx);
+#endif /* DISABLE_PLUGINS */
 
 #endif /* _NTFS_3G_COMMON_H */
